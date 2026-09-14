@@ -94,7 +94,7 @@ def build_sc_controls_panel(
     """
     from cellier.gui.qt.visuals import (
         QtClimRangeSlider,
-        QtColormapComboBox,
+        QtColormapCombo,
         QtVolumeRenderControls,
     )
     from PySide6 import QtWidgets
@@ -153,7 +153,7 @@ def build_sc_controls_panel(
         closables.append(clim_3d)
         _add_group(layout_3d, "Contrast limits", clim_3d.widget)
 
-        cmap_3d = QtColormapComboBox(vol_id, initial_colormap=vol_app.color_map)
+        cmap_3d = QtColormapCombo(vol_id, initial_colormap=vol_app.color_map)
         cmap_3d.add_colormaps(_DEFAULT_COLORMAPS)
         controller.connect_widget(
             cmap_3d, subscription_specs=cmap_3d.subscription_specs()

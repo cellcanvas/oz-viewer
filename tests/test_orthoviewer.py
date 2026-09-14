@@ -29,6 +29,21 @@ def _dock_titles(window) -> list[str]:
     return [d.windowTitle() for d in window.findChildren(QDockWidget)]
 
 
+def _dock_control_names(window, title: str) -> set[str]:
+    """Every group-box title and label inside the dock called *title*.
+
+    See the twin helper in ``test_viewer.py``: a dock title alone does not show
+    that cellier put any controls in it.
+    """
+    from PySide6.QtWidgets import QCheckBox, QDockWidget, QGroupBox, QLabel
+
+    dock = next(d for d in window.findChildren(QDockWidget) if d.windowTitle() == title)
+    names = {g.title() for g in dock.findChildren(QGroupBox)}
+    names |= {w.text() for w in dock.findChildren(QLabel)}
+    names |= {w.text() for w in dock.findChildren(QCheckBox)}
+    return {n for n in names if n}
+
+
 def test_single_channel_ortho_build(qapp, tmp_path):
     """Blobs (z,y,x) -> single-channel ortho: 4 panels, overlays, Rendering dock."""
     from oz_viewer.data._blobs import make_example_zarr
@@ -47,6 +62,16 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         assert overlays is not None
         assert len(overlays.axis_visual_ids) == 3
         assert overlays.transparency_manager.current_mode == "iso"
+
+        # A dims change reaches the overlays: the slice plane and the gizmo
+        # follow the XY panel's slider.  Off the voxel grid on purpose -- slice
+        # positions are floats, and an integer is where rounding rules agree.
+        controller = build.viewer.controller
+        z_axis = handle.geometry.spatial_axes[0]
+        controller.update_slice_indices(build.viewer.scenes["xy"].id, {z_axis: 12.3})
+        assert overlays.plane_store.positions[0, 0] == pytest.approx(12.3)
+        gizmo = controller.get_visual_model(overlays.axis_visual_ids[0])
+        assert gizmo.transform.translation[z_axis] == pytest.approx(12.3)
 
         # Qt-only appearance panel on the left dock; no channel dock.
         assert "Rendering" in _dock_titles(handle.window)
@@ -72,9 +97,32 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
         # Multichannel volume is locked to MIP; overlays present.
         assert build.overlays.transparency_manager.current_mode == "mip"
 
+        # The overlay meshes are 3-D (z, y, x) and broadcast over the channel
+        # axis, so they exist at every channel without per-channel updates.
+        controller = build.viewer.controller
+        world = build.viewer.scenes["vol"].dims.world_coordinate_system
+        overlay_ids = (build.overlays.plane_visual.id, *build.overlays.axis_visual_ids)
+        for visual_id in overlay_ids:
+            transform = controller.get_visual_model(visual_id).transform
+            assert transform.broadcast_axes == frozenset({world.axes[0].id})
+
+        # A channel slider steps through channels; spatial sliders are free.
+        from cellier.convenience import ContinuousAxisValues, DiscreteAxisValues
+
+        axis_values = handle.geometry.axis_values
+        assert axis_values[0] == DiscreteAxisValues(
+            values=tuple(float(i) for i in range(handle.geometry.n_channels))
+        )
+        assert all(isinstance(axis_values[a], ContinuousAxisValues) for a in (1, 2, 3))
+
         # ChannelControls dock ("Left") plus the Qt-only volume group ("Volume").
         titles = _dock_titles(handle.window)
         assert "Left" in titles
         assert "Volume" in titles
+
+        # The channel dock drives all four panels' sibling visuals, so it must
+        # actually hold one group per channel -- not just exist.
+        names = _dock_control_names(handle.window, "Left")
+        assert {f"Channel {i}" for i in range(handle.geometry.n_channels)} <= names
     finally:
         handle.close()

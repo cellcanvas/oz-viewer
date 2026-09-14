@@ -1,11 +1,11 @@
 """OME-Zarr metadata extraction shared by the convenience-based viewers.
 
 This module holds the pure, Qt-free logic that turns an OME-Zarr store into the
-handful of numbers the cellier ``convenience`` API needs: which axis is the
-channel axis, the spatial extents, the contrast-limit range, sensible slider
-decimals, and the voxel-to-world transform.  It has no cellier ``convenience``
-dependency itself so it can be reused by both the single-panel viewer and the
-orthoviewer.
+handful of objects the cellier ``convenience`` API needs: the world coordinate
+system, the voxel-to-world transform, which axis is the channel axis, the
+spatial extents, the slider values, the contrast-limit range, and sensible
+slider decimals.  It builds no viewer itself so it can be reused by both the
+single-panel viewer and the orthoviewer.
 """
 
 from __future__ import annotations
@@ -17,8 +17,9 @@ import numpy as np
 from oz_viewer.viewer._utils import _dtype_clim_max, _dtype_decimals, _perf_mark
 
 if TYPE_CHECKING:
+    from cellier.convenience import ContinuousAxisValues, DiscreteAxisValues
     from cellier.data.image import OMEZarrImageDataStore
-    from cellier.transform import AffineTransform
+    from cellier.transform import AffineTransform, WorldCoordinateSystem
 
     from oz_viewer._perf import StartupPerfTracer
 
@@ -31,7 +32,14 @@ class _ViewerGeometry(NamedTuple):
     spatial_ndim: int
     channel_axis: int | None
     n_channels: int
+    #: The world every scene shares, with the store's axis names, types and
+    #: units.  Pass this exact object to the viewer: a transform names its
+    #: endpoints by id, so an equal-looking world built elsewhere is rejected.
+    world: WorldCoordinateSystem
+    #: Level-0 voxel -> ``world``, scaled by the level-0 OME-Zarr scale.
     voxel_to_world: AffineTransform
+    #: World units per level-0 voxel, for every axis.
+    level_0_scale: np.ndarray
     #: World-space ``(shape - 1) * scale`` for every axis, used for centering.
     world_max_full: np.ndarray
     #: World-space ``(shape - 1) * scale`` for the spatial axes only.
@@ -58,27 +66,40 @@ class _ViewerGeometry(NamedTuple):
         return tuple(self.spatial_indices)
 
     @property
-    def axis_ranges(self) -> dict[int, tuple[float, float]]:
-        """World-space ``(0, world_max)`` per axis for the dims-slider ranges.
+    def axis_values(self) -> dict[int, ContinuousAxisValues | DiscreteAxisValues]:
+        """World-space slider values per axis, for the dims sliders.
 
-        Computed directly from the metadata rather than via
-        ``cellier.convenience.axis_ranges_from_viewer`` so it works for
-        multichannel visuals too (whose transform is spatial-only and cannot be
-        mapped against the full-ndim store shape).
+        The channel axis is discrete -- one stop per channel, so its slider
+        never rests between two channels.  Every other axis (spatial, time) is
+        continuous over ``[0, world_max]``, from the first voxel centre to the
+        last.  Derived from the metadata rather than via
+        ``cellier.convenience.axis_values_from_viewer``, which widens each axis
+        by half a voxel at both ends.
         """
-        return {
-            i: (0.0, round(float(self.world_max_full[i])))
-            for i in range(len(self.axis_names))
-        }
+        from cellier.convenience import ContinuousAxisValues, DiscreteAxisValues
+
+        values: dict[int, ContinuousAxisValues | DiscreteAxisValues] = {}
+        for axis in range(len(self.axis_names)):
+            if axis == self.channel_axis:
+                step = float(self.level_0_scale[axis])
+                values[axis] = DiscreteAxisValues(
+                    values=tuple(i * step for i in range(self.n_channels))
+                )
+            else:
+                values[axis] = ContinuousAxisValues(
+                    min=0.0, max=float(self.world_max_full[axis])
+                )
+        return values
 
     def center_slice_indices(self) -> dict[int, float]:
         """World-coordinate midpoints for each spatial axis.
 
-        Extra (non-spatial) axes such as channel are intentionally omitted so
-        they keep their default position of ``0``.
+        Not rounded: a slice position is a float world coordinate.  Extra
+        (non-spatial) axes such as channel are intentionally omitted so they
+        keep their default position of ``0``.
         """
         return {
-            axis: round(float(self.world_max_full[axis]) / 2.0)
+            axis: float(self.world_max_full[axis]) / 2.0
             for axis in self.spatial_indices
         }
 
@@ -110,7 +131,6 @@ def extract_viewer_geometry(
     """
     import yaozarrs
     from cellier.data.image import OMEZarrImageDataStore
-    from cellier.transform import AffineTransform
 
     _perf_mark(perf, "geometry.start", zarr_uri=zarr_uri)
     data_store = OMEZarrImageDataStore.from_path(zarr_uri)
@@ -158,9 +178,7 @@ def extract_viewer_geometry(
         )
         _perf_mark(perf, "geometry.metadata_printed")
 
-    voxel_to_world = AffineTransform.from_scale_and_translation(
-        scale=tuple(level_0_scale_full)
-    )
+    world, voxel_to_world = _world_and_transform(data_store, level_0_scale_full)
 
     initial_clim_max = _dtype_clim_max(data_store.dtype)
     slider_decimals = _dtype_decimals(data_store.dtype)
@@ -174,7 +192,9 @@ def extract_viewer_geometry(
         spatial_ndim=spatial_ndim,
         channel_axis=channel_axis,
         n_channels=n_channels,
+        world=world,
         voxel_to_world=voxel_to_world,
+        level_0_scale=level_0_scale_full,
         world_max_full=world_max_full,
         world_max_spatial=world_max_spatial,
         initial_clim_max=initial_clim_max,
@@ -184,6 +204,48 @@ def extract_viewer_geometry(
     )
     _perf_mark(perf, "geometry.ready")
     return data_store, geometry
+
+
+def _world_and_transform(
+    data_store: OMEZarrImageDataStore,
+    level_0_scale: np.ndarray,
+) -> tuple[WorldCoordinateSystem, AffineTransform]:
+    """Build the world system and the level-0 voxel -> world transform.
+
+    The world takes the store's own axes -- names, types and units -- one to
+    one, so every data axis maps onto the world axis of the same position and
+    type.  The transform is built against the store's level-0 coordinate
+    system and this world, which is what cellier checks when it is added.
+    """
+    from cellier.transform import AffineTransform, Axis, WorldCoordinateSystem
+
+    world = WorldCoordinateSystem(
+        name="world",
+        axes=tuple(
+            Axis(name=name, axis_type=axis_type, unit=unit)
+            for name, axis_type, unit in zip(
+                data_store.axis_names,
+                data_store.axis_types,
+                data_store.axis_units,
+                strict=True,
+            )
+        ),
+    )
+    level_0 = data_store.data_coordinate_systems[0]
+    voxel_to_world = AffineTransform.from_axis_map(
+        level_0,
+        world,
+        axis_map={
+            data_axis.id: world_axis.id
+            for data_axis, world_axis in zip(level_0.axes, world.axes, strict=True)
+        },
+        scale={
+            data_axis.id: float(scale)
+            for data_axis, scale in zip(level_0.axes, level_0_scale, strict=True)
+        },
+        name="voxel_to_world",
+    )
+    return world, voxel_to_world
 
 
 def _print_metadata_table(

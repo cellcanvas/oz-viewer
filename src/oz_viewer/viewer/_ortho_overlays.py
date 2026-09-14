@@ -330,38 +330,66 @@ def _make_axis_set_face_colors(
     )
 
 
-def _pad_positions(
-    positions_3d: np.ndarray,
+def _spatial_mesh_store(
+    positions_zyx: np.ndarray,
+    indices: np.ndarray,
+    colors: np.ndarray,
+    name: str,
+    *,
+    world,
     spatial_axes: tuple[int, int, int],
-    n_dims: int,
-) -> np.ndarray:
-    """Scatter 3-D local ZYX positions into an N-dim global positions array.
+):
+    """A face-coloured mesh store over the three spatial world axes only.
 
-    The three local columns (0=Z, 1=Y, 2=X) are placed at the global axis
-    indices given by ``spatial_axes``.  All other columns remain zero.
+    Its axes copy the world's spatial axes (name, type, unit), so
+    :func:`_mesh_to_world` can map them one to one.
     """
-    if n_dims == 3 and spatial_axes == (0, 1, 2):
-        return positions_3d
-    out = np.zeros((len(positions_3d), n_dims), dtype=positions_3d.dtype)
-    out[:, spatial_axes[0]] = positions_3d[:, 0]
-    out[:, spatial_axes[1]] = positions_3d[:, 1]
-    out[:, spatial_axes[2]] = positions_3d[:, 2]
-    return out
+    from cellier.data.mesh import MeshMemoryStore
+
+    zyx = [world.axes[axis] for axis in spatial_axes]
+    return MeshMemoryStore(
+        positions=positions_zyx,
+        indices=indices,
+        colors=colors,
+        colors_layout="face",
+        name=name,
+        axis_names=[axis.name for axis in zyx],
+        axis_types=[axis.axis_type for axis in zyx],
+        axis_units=[axis.unit for axis in zyx],
+    )
 
 
-def _spatial_translation(
-    z: float,
-    y: float,
-    x: float,
+def _mesh_to_world(
+    store,
+    world,
     spatial_axes: tuple[int, int, int],
-    n_dims: int,
-) -> tuple[float, ...]:
-    """Build an N-dim translation vector with spatial values at global axis indices."""
-    t = np.zeros(n_dims, dtype=np.float64)
-    t[spatial_axes[0]] = z
-    t[spatial_axes[1]] = y
-    t[spatial_axes[2]] = x
-    return tuple(float(v) for v in t)
+    translation_zyx=(0.0, 0.0, 0.0),
+):
+    """Place a 3-D ``(z, y, x)`` overlay mesh in the world.
+
+    The mesh has only the three spatial axes; every other world axis (channel,
+    time, ...) is broadcast, so the overlay exists at every position along
+    them and needs no update when their sliders move.
+    """
+    from cellier.transform import AffineTransform
+
+    data = store.data_coordinate_system
+    return AffineTransform.from_axis_map(
+        data,
+        world,
+        axis_map={
+            data.axes[i].id: world.axes[axis].id for i, axis in enumerate(spatial_axes)
+        },
+        translation={
+            data.axes[i].id: float(value) for i, value in enumerate(translation_zyx)
+        },
+        broadcast_output_axes=[
+            world.axes[axis].id
+            for axis in range(world.ndim)
+            if axis not in spatial_axes
+        ],
+        name="overlay_to_world",
+    )
 
 
 def _make_axis_meshes(
@@ -371,12 +399,10 @@ def _make_axis_meshes(
     world_min_extent: float,
     *,
     spatial_axes: tuple[int, int, int],
-    n_dims: int,
 ) -> tuple:
-    from cellier.data.mesh import MeshMemoryStore
-    from cellier.transform import AffineTransform
     from cellier.visuals import MeshFlatAppearance
 
+    world = vol_scene.dims.world_coordinate_system
     color_z = _PLANE_COLOR_XY
     color_y = _PLANE_COLOR_XZ
     color_x = _PLANE_COLOR_YZ
@@ -391,25 +417,23 @@ def _make_axis_meshes(
     cube_side = _AXIS_3D_CUBE_SIDE_FRACTION * world_min_extent
     prism_cross_section = _AXIS_3D_PRISM_CROSS_SECTION_FRACTION * world_min_extent
 
-    initial_translation = _spatial_translation(
-        float(initial_centre_zyx[0]),
-        float(initial_centre_zyx[1]),
-        float(initial_centre_zyx[2]),
-        spatial_axes,
-        n_dims,
-    )
-    initial_transform = AffineTransform.from_translation(initial_translation)
-
     axis_stores = []
     axis_visuals = []
     for view_name, axis_a, axis_b, color_a, color_b in view_specifications:
-        positions_3d, indices = _make_axis_set_geometry(
+        positions, indices = _make_axis_set_geometry(
             axis_a, axis_b, axis_length, cube_side, prism_cross_section
         )
-        positions = _pad_positions(positions_3d, spatial_axes, n_dims)
         face_colors = _make_axis_set_face_colors(color_a, color_b)
-        store = MeshMemoryStore(
-            positions=positions, indices=indices, colors=face_colors, name=view_name
+        store = _spatial_mesh_store(
+            positions,
+            indices,
+            face_colors,
+            view_name,
+            world=world,
+            spatial_axes=spatial_axes,
+        )
+        initial_transform = _mesh_to_world(
+            store, world, spatial_axes, initial_centre_zyx
         )
         appearance = MeshFlatAppearance(
             color_mode="face",
@@ -439,32 +463,29 @@ def _make_plane_positions(
     y_world: float,
     x_world: float,
     world_max_zyx: np.ndarray,
-    *,
-    spatial_axes: tuple[int, int, int] = (0, 1, 2),
-    n_dims: int = 3,
 ) -> np.ndarray:
+    """``(12, 3)`` ``(z, y, x)`` vertices of the three slice planes."""
     wz = float(world_max_zyx[0])
     wy = float(world_max_zyx[1])
     wx = float(world_max_zyx[2])
     z, y, x = float(z_world), float(y_world), float(x_world)
-    sz0, sz1, sz2 = spatial_axes
 
-    positions = np.zeros((12, n_dims), dtype=np.float32)
+    positions = np.zeros((12, 3), dtype=np.float32)
 
     # XY plane (constant Z = z)
-    positions[0:4, sz0] = z
-    positions[0:4, sz1] = [0.0, wy, wy, 0.0]
-    positions[0:4, sz2] = [0.0, 0.0, wx, wx]
+    positions[0:4, 0] = z
+    positions[0:4, 1] = [0.0, wy, wy, 0.0]
+    positions[0:4, 2] = [0.0, 0.0, wx, wx]
 
     # XZ plane (constant Y = y)
-    positions[4:8, sz0] = [0.0, wz, wz, 0.0]
-    positions[4:8, sz1] = y
-    positions[4:8, sz2] = [0.0, 0.0, wx, wx]
+    positions[4:8, 0] = [0.0, wz, wz, 0.0]
+    positions[4:8, 1] = y
+    positions[4:8, 2] = [0.0, 0.0, wx, wx]
 
     # YZ plane (constant X = x)
-    positions[8:12, sz0] = [0.0, wz, wz, 0.0]
-    positions[8:12, sz1] = [0.0, 0.0, wy, wy]
-    positions[8:12, sz2] = x
+    positions[8:12, 0] = [0.0, wz, wz, 0.0]
+    positions[8:12, 1] = [0.0, 0.0, wy, wy]
+    positions[8:12, 2] = x
 
     return positions
 
@@ -493,34 +514,35 @@ def _make_plane_mesh(
     world_max_zyx: np.ndarray,
     initial_opacity: float = 0.4,
     *,
-    spatial_axes: tuple[int, int, int] = (0, 1, 2),
-    n_dims: int = 3,
+    spatial_axes: tuple[int, int, int],
 ):
-    from cellier.data.mesh import MeshMemoryStore
     from cellier.visuals import MeshFlatAppearance
 
-    positions = _make_plane_positions(
-        z_world,
-        y_world,
-        x_world,
-        world_max_zyx,
-        spatial_axes=spatial_axes,
-        n_dims=n_dims,
-    )
+    world = vol_scene.dims.world_coordinate_system
+    positions = _make_plane_positions(z_world, y_world, x_world, world_max_zyx)
     colors = _make_plane_colors(initial_opacity)
     indices = np.array(
         [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [8, 9, 10], [8, 10, 11]],
         dtype=np.int32,
     )
 
-    store = MeshMemoryStore(
-        positions=positions, indices=indices, colors=colors, name="slice_planes"
+    store = _spatial_mesh_store(
+        positions,
+        indices,
+        colors,
+        "slice_planes",
+        world=world,
+        spatial_axes=spatial_axes,
     )
     appearance = MeshFlatAppearance(
         color_mode="face", side="both", opacity=initial_opacity, wireframe=False
     )
     visual = controller.add_mesh(
-        data=store, scene_id=vol_scene.id, appearance=appearance, name="slice_planes"
+        data=store,
+        scene_id=vol_scene.id,
+        appearance=appearance,
+        name="slice_planes",
+        transform=_mesh_to_world(store, world, spatial_axes),
     )
     return store, visual
 
@@ -533,9 +555,7 @@ class _PlaneUpdater:
         plane_visual,
         world_max_zyx,
         *,
-        spatial_axes: tuple[int, int, int] = (0, 1, 2),
-        n_dims: int = 3,
-        channel_axis: int | None = None,
+        spatial_axes: tuple[int, int, int],
     ) -> None:
         self._id = uuid4()
         self._controller = controller
@@ -543,67 +563,35 @@ class _PlaneUpdater:
         self._plane_visual = plane_visual
         self._world_max_zyx = world_max_zyx
         self._spatial_axes = spatial_axes
-        self._n_dims = n_dims
-        self._channel_axis = channel_axis
-        self._ch_world: float = 0.0
 
-        # Read initial slice positions from the N-dim positions array.
+        # Read initial slice positions from the (z, y, x) positions array.
         positions = plane_store.positions
-        sz0, sz1, sz2 = spatial_axes
-        self._z_world = float(positions[0, sz0])  # XY plane vertex 0: Z
-        self._y_world = float(positions[4, sz1])  # XZ plane vertex 4: Y
-        self._x_world = float(positions[8, sz2])  # YZ plane vertex 8: X
+        self._z_world = float(positions[0, 0])  # XY plane vertex 0: Z
+        self._y_world = float(positions[4, 1])  # XZ plane vertex 4: Y
+        self._x_world = float(positions[8, 2])  # YZ plane vertex 8: X
 
     def _update(self) -> None:
-        positions = _make_plane_positions(
-            self._z_world,
-            self._y_world,
-            self._x_world,
-            self._world_max_zyx,
-            spatial_axes=self._spatial_axes,
-            n_dims=self._n_dims,
+        self._plane_store.positions = _make_plane_positions(
+            self._z_world, self._y_world, self._x_world, self._world_max_zyx
         )
-        if self._channel_axis is not None:
-            positions[:, self._channel_axis] = self._ch_world
-        self._plane_store.positions = positions
         self._controller.reslice_visual(self._plane_visual.id)
 
-    def on_channel_changed(self, new_ch: int) -> None:
-        self._ch_world = float(new_ch)
-        # Only update the store positions; reslice_scene (triggered by
-        # update_slice_indices on the vol scene) handles the actual reslice with
-        # the correct channel dims, avoiding a conflicting reslice with stale dims.
-        positions = _make_plane_positions(
-            self._z_world,
-            self._y_world,
-            self._x_world,
-            self._world_max_zyx,
-            spatial_axes=self._spatial_axes,
-            n_dims=self._n_dims,
-        )
-        if self._channel_axis is not None:
-            positions[:, self._channel_axis] = self._ch_world
-        self._plane_store.positions = positions
-
     def on_xy_dims_changed(self, event) -> None:
-        slice_indices = event.dims_state.selection.slice_indices
         sz0 = self._spatial_axes[0]
-        if sz0 in slice_indices:
-            self._z_world = float(slice_indices[sz0])
+        if sz0 in event.slice_indices:
+            self._z_world = float(event.slice_indices[sz0])
             self._update()
 
     def on_xz_dims_changed(self, event) -> None:
-        slice_indices = event.dims_state.selection.slice_indices
         sz1 = self._spatial_axes[1]
-        if sz1 in slice_indices:
-            self._y_world = float(slice_indices[sz1])
+        if sz1 in event.slice_indices:
+            self._y_world = float(event.slice_indices[sz1])
             self._update()
 
     def on_yz_dims_changed(self, event) -> None:
-        slice_indices = event.dims_state.selection.slice_indices
         sz2 = self._spatial_axes[2]
-        if sz2 in slice_indices:
-            self._x_world = float(slice_indices[sz2])
+        if sz2 in event.slice_indices:
+            self._x_world = float(event.slice_indices[sz2])
             self._update()
 
 
@@ -616,118 +604,80 @@ class _OrientationUpdater:
         yz_axis_visual,
         world_max_zyx: np.ndarray,
         *,
-        xy_axis_store=None,
-        xz_axis_store=None,
-        yz_axis_store=None,
-        spatial_axes: tuple[int, int, int] = (0, 1, 2),
-        n_dims: int = 3,
-        channel_axis: int | None = None,
+        axis_stores: tuple,
+        world,
+        spatial_axes: tuple[int, int, int],
     ):
         self._id = uuid4()
         self._controller = controller
         self._xy_axis_visual_id = xy_axis_visual.id
         self._xz_axis_visual_id = xz_axis_visual.id
         self._yz_axis_visual_id = yz_axis_visual.id
-        self._xy_axis_store = xy_axis_store
-        self._xz_axis_store = xz_axis_store
-        self._yz_axis_store = yz_axis_store
+        self._axis_stores = axis_stores
+        self._world = world
         self._spatial_axes = spatial_axes
-        self._n_dims = n_dims
-        self._channel_axis = channel_axis
-        self._ch_world: float = 0.0
 
         mid = world_max_zyx / 2.0
         self._z_world = float(mid[0])
         self._y_world = float(mid[1])
         self._x_world = float(mid[2])
-        # N-dim centre vectors, one per 2D panel.
-        self._xy_centre = self._make_centre(self._z_world, self._y_world, self._x_world)
+        # (z, y, x) centre vectors, one per 2D panel.
+        self._xy_centre = np.array(
+            [self._z_world, self._y_world, self._x_world], dtype=np.float64
+        )
         self._xz_centre = self._xy_centre.copy()
         self._yz_centre = self._xy_centre.copy()
 
-    def _make_centre(self, z: float, y: float, x: float) -> np.ndarray:
-        c = np.zeros(self._n_dims, dtype=np.float64)
-        c[self._spatial_axes[0]] = z
-        c[self._spatial_axes[1]] = y
-        c[self._spatial_axes[2]] = x
-        if self._channel_axis is not None:
-            c[self._channel_axis] = self._ch_world
-        return c
-
-    def on_channel_changed(self, new_ch: int) -> None:
-        self._ch_world = float(new_ch)
-        if self._channel_axis is not None:
-            self._xy_centre[self._channel_axis] = self._ch_world
-            self._xz_centre[self._channel_axis] = self._ch_world
-            self._yz_centre[self._channel_axis] = self._ch_world
-            # Update channel column in each axis store so the slab filter keeps
-            # the meshes visible. reslice_scene (from update_slice_indices on the
-            # vol scene) handles the actual reslice — no reslice_visual here.
-            for store in (
-                self._xy_axis_store,
-                self._xz_axis_store,
-                self._yz_axis_store,
-            ):
-                if store is not None:
-                    positions = store.positions.copy()
-                    positions[:, self._channel_axis] = self._ch_world
-                    store.positions = positions
-        self._update_3d()
-
     def _update_3d(self) -> None:
-        from cellier.transform import AffineTransform
-
-        for visual_id, centre_nd in zip(
+        for visual_id, store, centre_zyx in zip(
             (self._xy_axis_visual_id, self._xz_axis_visual_id, self._yz_axis_visual_id),
+            self._axis_stores,
             (self._xy_centre, self._xz_centre, self._yz_centre),
-            strict=False,
+            strict=True,
         ):
             self._controller.set_visual_transform(
                 visual_id,
-                AffineTransform.from_translation(tuple(float(v) for v in centre_nd)),
+                _mesh_to_world(store, self._world, self._spatial_axes, centre_zyx),
                 reslice=False,
             )
 
     def on_xy_camera_changed(self, event) -> None:
         p = event.camera_state.position
         # p[0] → X world, p[1] → Y world (canvas horizontal/vertical convention)
-        self._xy_centre = self._make_centre(self._z_world, p[1], p[0])
+        self._xy_centre = np.array([self._z_world, p[1], p[0]], dtype=np.float64)
         self._update_3d()
 
     def on_xz_camera_changed(self, event) -> None:
         p = event.camera_state.position
         # p[0] → X world, p[1] → Z world
-        self._xz_centre = self._make_centre(p[1], self._y_world, p[0])
+        self._xz_centre = np.array([p[1], self._y_world, p[0]], dtype=np.float64)
         self._update_3d()
 
     def on_yz_camera_changed(self, event) -> None:
         p = event.camera_state.position
         # p[0] → Y world, p[1] → Z world
-        self._yz_centre = self._make_centre(p[1], p[0], self._x_world)
+        self._yz_centre = np.array([p[1], p[0], self._x_world], dtype=np.float64)
         self._update_3d()
 
     def on_xy_dims_changed(self, event) -> None:
-        slice_indices = event.dims_state.selection.slice_indices
         sz0 = self._spatial_axes[0]
-        if sz0 in slice_indices:
-            self._z_world = float(slice_indices[sz0])
-            self._xy_centre[sz0] = self._z_world
+        if sz0 in event.slice_indices:
+            self._z_world = float(event.slice_indices[sz0])
+            self._xy_centre[0] = self._z_world
         self._update_3d()
 
     def on_xz_dims_changed(self, event) -> None:
-        slice_indices = event.dims_state.selection.slice_indices
         sz1 = self._spatial_axes[1]
-        if sz1 in slice_indices:
-            self._y_world = float(slice_indices[sz1])
-            self._xz_centre[sz1] = self._y_world
+        if sz1 in event.slice_indices:
+            self._y_world = float(event.slice_indices[sz1])
+            self._xz_centre[1] = self._y_world
         self._update_3d()
 
     def on_yz_dims_changed(self, event) -> None:
-        slice_indices = event.dims_state.selection.slice_indices
         sz2 = self._spatial_axes[2]
-        if sz2 in slice_indices:
-            self._x_world = float(slice_indices[sz2])
-            self._yz_centre[sz2] = self._x_world
+        if sz2 in event.slice_indices:
+            self._x_world = float(event.slice_indices[sz2])
+            self._yz_centre[2] = self._x_world
         self._update_3d()
 
 
@@ -807,8 +757,6 @@ def attach_ortho_overlays(
     vol_scene = scenes["vol"]
 
     spatial_axes = geometry.spatial_axes
-    n_dims_world = len(geometry.axis_names)
-    channel_axis = geometry.channel_axis
     world_max_zyx = geometry.world_max_spatial
 
     center = geometry.center_slice_indices()
@@ -827,7 +775,6 @@ def attach_ortho_overlays(
         initial_centre_zyx=initial_centre_zyx,
         world_min_extent=float(world_max_zyx.min()),
         spatial_axes=spatial_axes,
-        n_dims=n_dims_world,
     )
     axis_visual_ids = [xy_axis_visual.id, xz_axis_visual.id, yz_axis_visual.id]
 
@@ -841,7 +788,6 @@ def attach_ortho_overlays(
         world_max_zyx,
         initial_opacity=_INITIAL_PLANE_OPACITY,
         spatial_axes=spatial_axes,
-        n_dims=n_dims_world,
     )
 
     plane_updater = _PlaneUpdater(
@@ -850,8 +796,6 @@ def attach_ortho_overlays(
         plane_visual=plane_visual,
         world_max_zyx=world_max_zyx,
         spatial_axes=spatial_axes,
-        n_dims=n_dims_world,
-        channel_axis=channel_axis,
     )
     controller.on_dims_changed(
         scenes["xy"].id, plane_updater.on_xy_dims_changed, owner_id=plane_updater._id
@@ -894,13 +838,10 @@ def attach_ortho_overlays(
         xy_axis_visual=xy_axis_visual,
         xz_axis_visual=xz_axis_visual,
         yz_axis_visual=yz_axis_visual,
-        xy_axis_store=xy_axis_store,
-        xz_axis_store=xz_axis_store,
-        yz_axis_store=yz_axis_store,
         world_max_zyx=world_max_zyx,
+        axis_stores=(xy_axis_store, xz_axis_store, yz_axis_store),
+        world=vol_scene.dims.world_coordinate_system,
         spatial_axes=spatial_axes,
-        n_dims=n_dims_world,
-        channel_axis=channel_axis,
     )
     orient_owner = orient_updater._id
     controller.on_camera_changed(
@@ -922,33 +863,10 @@ def attach_ortho_overlays(
         scenes["yz"].id, orient_updater.on_yz_dims_changed, owner_id=orient_updater._id
     )
 
+    # No channel following is needed: the overlay meshes are broadcast over
+    # every non-spatial world axis (see _mesh_to_world), so moving a channel or
+    # time slider leaves them in place.
     owner_ids = [plane_updater._id, orient_updater._id]
-
-    # --- channel following (replaces the old _ChannelAxisSyncer) ---
-    # In single-channel mode the channel axis is a normal (synced) extra axis;
-    # the overlays must track it.  The convenience OrthoViewer's built-in
-    # _ExtraAxisSyncer keeps the channel in step across panels, so a thin bridge
-    # on the vol scene forwards the new channel to the updaters (conversion plan
-    # D4.5).  In multichannel mode the channel axis is stacked (no slider, never
-    # changes) so no bridge is needed.
-    if channel_axis is not None and not vol_is_multichannel:
-        bridge_owner = uuid4()
-
-        def _on_channel_bridge(event) -> None:
-            slice_indices = event.dims_state.selection.slice_indices
-            if channel_axis not in slice_indices:
-                return
-            new_ch = int(slice_indices[channel_axis])
-            plane_updater.on_channel_changed(new_ch)
-            controller.reslice_visual(plane_visual.id)
-            orient_updater.on_channel_changed(new_ch)
-            for vid in axis_visual_ids:
-                controller.reslice_visual(vid)
-
-        controller.on_dims_changed(
-            vol_scene.id, _on_channel_bridge, owner_id=bridge_owner
-        )
-        owner_ids.append(bridge_owner)
 
     # --- seed the orientation gizmo from post-fit camera state ---
     # The initial camera fit is deferred to the canvas first frame (fit="ready"),

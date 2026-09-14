@@ -104,7 +104,7 @@ def build_viewer(
     from cellier.convenience import Viewer
 
     viewer = Viewer(
-        axis_labels=geometry.axis_names,
+        geometry.world,
         dim="2d",
         render_config=_render_config(),
         gui=gui,
@@ -135,25 +135,28 @@ def _add_single_channel_visual(
     geometry: _ViewerGeometry,
 ) -> None:
     """Add a single-channel multiscale image visual + appearance controls."""
+    from cellier.convenience import MultiscaleImageControlsConfig
+    from cellier.visuals import MultiscaleImageAppearance
+
     clim_max = geometry.initial_clim_max
     viewer.add_image_multiscale(
         data_store,
-        appearance={
-            "color_map": "viridis",
-            "clim": (0.0, clim_max),
-            "lod_bias": _INITIAL_LOD_BIAS,
-            "iso_threshold": clim_max / 2.0,
-            "render_mode": "mip",
-            "attenuation": 1.0,
-        },
+        appearance=MultiscaleImageAppearance(
+            color_map="viridis",
+            clim=(0.0, clim_max),
+            lod_bias=_INITIAL_LOD_BIAS,
+            iso_threshold=clim_max / 2.0,
+            render_mode="mip",
+            attenuation=1.0,
+        ),
         name="volume",
         render_config=_visual_render_config(),
         transform=geometry.voxel_to_world,
-        controls={
-            "appearance": _APPEARANCE_FIELDS,
-            "colormap_names": _DEFAULT_COLORMAPS,
-            "clim_range": geometry.clim_range,
-        },
+        controls=MultiscaleImageControlsConfig(
+            appearance=_APPEARANCE_FIELDS,
+            colormap_names=_DEFAULT_COLORMAPS,
+            clim_range=geometry.clim_range,
+        ),
     )
 
 
@@ -168,6 +171,7 @@ def _add_multichannel_visual(
     channels at once) and no redundant dims slider appears for it -- the
     ``ChannelControls`` dock owns per-channel visibility instead.
     """
+    from cellier.convenience import ChannelControlsConfig
     from cellier.visuals import ChannelAppearance
 
     clim_max = geometry.initial_clim_max
@@ -195,11 +199,11 @@ def _add_multichannel_visual(
         transform=geometry.voxel_to_world,
         max_channels_2d=max_channels,
         max_channels_3d=max_channels,
-        controls={
-            "fields": _CHANNEL_FIELDS,
-            "colormap_names": _DEFAULT_COLORMAPS,
-            "clim_range": geometry.clim_range,
-        },
+        controls=ChannelControlsConfig(
+            fields=_CHANNEL_FIELDS,
+            colormap_names=_DEFAULT_COLORMAPS,
+            clim_range=geometry.clim_range,
+        ),
     )
 
     # Stack the channel axis: drop it from slice_indices and mark it stacked so
@@ -240,7 +244,7 @@ def build_viewer_layout(
 
     canvas_view = build_canvas_widget(
         viewer,
-        geometry.axis_ranges,
+        geometry.axis_values,
         depth_range_3d=geometry.depth_range,
         canvas_size=min_canvas_size,
     )

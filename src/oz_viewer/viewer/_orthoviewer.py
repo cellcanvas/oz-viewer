@@ -123,7 +123,7 @@ def build_ortho_viewer(
         )
 
     viewer = OrthoViewer(
-        axis_labels=geometry.axis_names,
+        geometry.world,
         spatial_axes=geometry.spatial_axes,
         render_config=_controller_render_config(),
         gui=gui,
@@ -216,6 +216,7 @@ def _add_multichannel_visuals(
     as a composited stack (all channels at once) with no redundant dims slider;
     the cross-toolkit ``ChannelControls`` dock owns per-channel visibility.
     """
+    from cellier.convenience import ChannelControlsConfig
     from cellier.visuals import ChannelAppearance
 
     controller = viewer.controller
@@ -244,11 +245,11 @@ def _add_multichannel_visuals(
         transform=geometry.voxel_to_world,
         max_channels_2d=max_channels,
         max_channels_3d=max_channels,
-        controls={
-            "fields": _CHANNEL_FIELDS,
-            "colormap_names": _DEFAULT_COLORMAPS,
-            "clim_range": geometry.clim_range,
-        },
+        controls=ChannelControlsConfig(
+            fields=_CHANNEL_FIELDS,
+            colormap_names=_DEFAULT_COLORMAPS,
+            clim_range=geometry.clim_range,
+        ),
     )
 
     # Stack the channel axis on every panel: drop it from slice_indices and mark
@@ -271,10 +272,10 @@ def _add_multichannel_visuals(
 def _center_ortho_slices(viewer: OrthoViewer, geometry: _ViewerGeometry) -> None:
     """Center each panel's sliced spatial axis at the volume midpoint.
 
-    Applied directly from OME-Zarr metadata rather than via
-    ``OrthoViewer.center_slices`` -> ``axis_ranges_from_ortho``, which crashes
-    for multichannel visuals (spatial-only transform vs full-ndim store, see
-    conversion plan Phase 1 finding).  Extra axes (channel) keep position 0.
+    Applied from the OME-Zarr metadata rather than via
+    ``OrthoViewer.center_slices`` so the midpoint agrees with
+    :attr:`_ViewerGeometry.axis_values`, which spans voxel centres rather than
+    voxel edges.  Extra axes (channel) keep position 0.
     """
     center = geometry.center_slice_indices()
     for scene in viewer.scenes.values():
@@ -321,7 +322,7 @@ def build_ortho_layout(
     viewer = build.viewer
     grid = build_ortho_grid_widget(
         viewer,
-        geometry.axis_ranges,
+        geometry.axis_values,
         depth_range_3d=geometry.depth_range,
         canvas_size=min_canvas_size,
     )
