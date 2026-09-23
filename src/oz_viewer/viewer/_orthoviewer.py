@@ -2,15 +2,16 @@
 
 Rebuilt on :class:`cellier.convenience.OrthoViewer`, so the same builder runs
 under both ``gui="qt"`` (desktop / CLI) and ``gui="anywidget"`` (Jupyter /
-marimo).  The four pre-wired panels, cross-panel extra-axis sync, and the
-per-channel ``ChannelControls`` dock come from the convenience API; the
-OME-Zarr-specific geometry (see :mod:`oz_viewer.viewer._geometry`) and the 3D
-overlays (see :mod:`oz_viewer.viewer._ortho_overlays`) are re-attached on top.
+marimo).  The four pre-wired panels, cross-panel axis sync, the image fanned
+out to every panel, and the image control (``AppearanceControls``, driving all
+four panels together, with the single/composite switch) come from the
+convenience API; the OME-Zarr-specific geometry (see
+:mod:`oz_viewer.viewer._geometry`) and the 3D overlays (see
+:mod:`oz_viewer.viewer._ortho_overlays`) are re-attached on top.
 
-The single-channel appearance panel and the volume render/opacity groups have
-no convenience equivalent for an ``OrthoViewer``, so they are built as Qt-only
-docks (see :mod:`oz_viewer.viewer._ortho_controls`) that are omitted in the
-anywidget path.
+The overlay controls (orientation gizmo toggle, slice-plane opacity) have no
+convenience equivalent, so they are a Qt-only dock (see
+:mod:`oz_viewer.viewer._ortho_controls`) that is omitted in the anywidget path.
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal
 
 from oz_viewer.viewer._geometry import _ViewerGeometry, extract_viewer_geometry
+from oz_viewer.viewer._image import controller_render_config, image_visual_kwargs
 from oz_viewer.viewer._ortho_overlays import (
     _PLANE_COLOR_XY,
     _PLANE_COLOR_XZ,
@@ -33,7 +35,6 @@ from oz_viewer.viewer._utils import (
     _perf_mark,
     _sidecar_options,
 )
-from oz_viewer.viewer._widgets import _DEFAULT_COLORMAPS
 
 if TYPE_CHECKING:
     from cellier.convenience import OrthoViewer
@@ -41,44 +42,15 @@ if TYPE_CHECKING:
 
     from oz_viewer._perf import StartupPerfTracer
 
-# Per-channel fields exposed in the multichannel dock, in order.
-_CHANNEL_FIELDS = ["visible", "color_map", "clim", "opacity"]
-
-
-def _controller_render_config() -> object:
-    """The controller render-pipeline config shared by every panel."""
-    from cellier.render import (
-        RenderManagerConfig,
-        SlicingConfig,
-        TemporalAccumulationConfig,
-    )
-
-    return RenderManagerConfig(
-        slicing=SlicingConfig(batch_size=32, render_every=4),
-        temporal=TemporalAccumulationConfig(enabled=False),
-    )
-
-
-def _panel_render_config(gpu_budget_mb: int) -> object:
-    """LOD / GPU-budget config for a multiscale image visual."""
-    from cellier.visuals import MultiscaleImageRenderConfig
-
-    return MultiscaleImageRenderConfig(
-        block_size=32,
-        gpu_budget_bytes=gpu_budget_mb * 1024**2,
-        gpu_budget_bytes_2d=64 * 1024**2,
-    )
-
 
 @dataclass
 class _OrthoBuild:
     """The convenience OrthoViewer plus the handles overlays/controls need."""
 
     viewer: OrthoViewer
+    #: The image's panel siblings, keyed ``xy``/``xz``/``yz``/``vol``.
     visuals: dict
-    is_multichannel: bool
     vol_visual_id: object
-    channel_appearances: dict | None = None
     overlays: OrthoOverlays | None = None
 
 
@@ -95,9 +67,9 @@ def build_ortho_viewer(
 ) -> _OrthoBuild:
     """Build a :class:`cellier.convenience.OrthoViewer` for an OME-Zarr store.
 
-    Chooses a single-channel or multichannel visual at build time based on
-    whether *geometry* found a channel axis (D1 in the conversion plan): there
-    is no runtime single<->multichannel toggle.
+    Fans one multiscale image out to every panel.  When *geometry* found a
+    channel axis the image starts in composite mode; the image control
+    switches every panel to single mode (and back) at runtime.
 
     Parameters
     ----------
@@ -125,148 +97,46 @@ def build_ortho_viewer(
     viewer = OrthoViewer(
         geometry.world,
         spatial_axes=geometry.spatial_axes,
-        render_config=_controller_render_config(),
+        render_config=controller_render_config(),
         gui=gui,
     )
     viewer.controller.camera_reslice_enabled = True
     viewer.controller.camera_settle_threshold_s = 0.3
 
-    if geometry.channel_axis is not None:
-        build = _add_multichannel_visuals(viewer, data_store, geometry)
-    else:
-        build = _add_single_channel_visuals(viewer, data_store, geometry)
-
+    build = _add_image_visuals(viewer, data_store, geometry)
     _center_ortho_slices(viewer, geometry)
     return build
 
 
-def _add_single_channel_visuals(
+def _add_image_visuals(
     viewer: OrthoViewer,
     data_store: OMEZarrImageDataStore,
     geometry: _ViewerGeometry,
 ) -> _OrthoBuild:
-    """Add a single-channel multiscale image to every panel.
+    """Fan one multiscale image out to every panel.
 
-    The three 2D panels share a MIP/viridis appearance; the ``vol`` panel gets
-    its own ISO/white appearance forced to the coarsest level (matching the
-    hand-built orthoviewer), so visuals are added per scene rather than via the
-    convenience fan-out.
+    The image control drives the four panels as one group, so they share an
+    appearance.  Only the ``vol`` panel's level-of-detail policy differs: it
+    is pinned to the coarsest level and not frustum-culled.  Those shared
+    appearance fields are not in the control, so the group never overwrites
+    them.
     """
-    from cellier.visuals import MultiscaleImageAppearance
-
     controller = viewer.controller
-    scenes = viewer.scenes
-    clim_max = geometry.initial_clim_max
-    coarsest_level = data_store.n_levels - 1
-
-    visuals: dict = {}
-    for key in ("xy", "xz", "yz"):
-        visuals[key] = controller.add_image_multiscale(
-            data_store,
-            scenes[key].id,
-            appearance=MultiscaleImageAppearance(
-                color_map="viridis",
-                clim=(0.0, clim_max),
-                lod_bias=1.0,
-                iso_threshold=0.2,
-                render_mode="mip",
-                frustum_cull=True,
-            ),
-            name=f"{key}_volume",
-            render_config=_panel_render_config(512),
-            transform=geometry.voxel_to_world,
-        )
-
-    vol_visual = controller.add_image_multiscale(
+    visuals = viewer.add_image_multiscale(
         data_store,
-        scenes["vol"].id,
-        appearance=MultiscaleImageAppearance(
-            color_map="white",
-            clim=(0.0, clim_max),
-            lod_bias=1.0,
-            force_level=coarsest_level,
-            frustum_cull=False,
-            iso_threshold=clim_max / 2.0,
-            render_mode="iso",
-        ),
-        name="vol_volume",
-        render_config=_panel_render_config(2048),
-        transform=geometry.voxel_to_world,
+        name="image",
+        **image_visual_kwargs(geometry, render_mode="iso", lod_bias=1.0),
     )
+
+    vol_visual = visuals["vol"]
+    controller.update_appearance_field(
+        vol_visual.id, "force_level", data_store.n_levels - 1
+    )
+    controller.update_appearance_field(vol_visual.id, "frustum_cull", False)
     vol_visual.aabb.enabled = True
     vol_visual.aabb.color = "#ff00ff"
-    visuals["vol"] = vol_visual
 
-    return _OrthoBuild(
-        viewer=viewer,
-        visuals=visuals,
-        is_multichannel=False,
-        vol_visual_id=vol_visual.id,
-    )
-
-
-def _add_multichannel_visuals(
-    viewer: OrthoViewer,
-    data_store: OMEZarrImageDataStore,
-    geometry: _ViewerGeometry,
-) -> _OrthoBuild:
-    """Add a multichannel multiscale image to every panel + channel controls.
-
-    The channel axis is moved to ``stacked_axes`` on each panel so it renders
-    as a composited stack (all channels at once) with no redundant dims slider;
-    the cross-toolkit ``ChannelControls`` dock owns per-channel visibility.
-    """
-    from cellier.convenience import ChannelControlsConfig
-    from cellier.visuals import ChannelAppearance
-
-    controller = viewer.controller
-    channel_axis = geometry.channel_axis
-    assert channel_axis is not None
-    clim_max = geometry.initial_clim_max
-    n = geometry.n_channels
-
-    channels = {
-        i: ChannelAppearance(
-            color_map=_DEFAULT_COLORMAPS[i % len(_DEFAULT_COLORMAPS)],
-            clim=(0.0, clim_max),
-            visible=True,
-        )
-        for i in range(n)
-    }
-    # Raise the per-visual channel-node budget to cover every channel so
-    # construction and the ChannelControls dock never exceed the cap.
-    max_channels = max(8, n)
-    visuals = viewer.add_multichannel_image_multiscale(
-        data_store,
-        channel_axis=channel_axis,
-        channels=channels,
-        name="multichannel",
-        render_config=_panel_render_config(512),
-        transform=geometry.voxel_to_world,
-        max_channels_2d=max_channels,
-        max_channels_3d=max_channels,
-        controls=ChannelControlsConfig(
-            fields=_CHANNEL_FIELDS,
-            colormap_names=_DEFAULT_COLORMAPS,
-            clim_range=geometry.clim_range,
-        ),
-    )
-
-    # Stack the channel axis on every panel: drop it from slice_indices and mark
-    # it stacked so all channels render and no channel slider is shown.
-    for scene in viewer.scenes.values():
-        current = dict(scene.dims.selection.slice_indices)
-        current.pop(channel_axis, None)
-        controller.update_slice_indices(scene.id, current)
-        controller.set_stacked_axes(scene.id, (channel_axis,))
-
-    return _OrthoBuild(
-        viewer=viewer,
-        visuals=visuals,
-        is_multichannel=True,
-        vol_visual_id=visuals["vol"].id,
-        channel_appearances=channels,
-    )
+    return _OrthoBuild(viewer=viewer, visuals=visuals, vol_visual_id=vol_visual.id)
 
 
 def _center_ortho_slices(viewer: OrthoViewer, geometry: _ViewerGeometry) -> None:
@@ -279,11 +149,10 @@ def _center_ortho_slices(viewer: OrthoViewer, geometry: _ViewerGeometry) -> None
     """
     center = geometry.center_slice_indices()
     for scene in viewer.scenes.values():
-        current = dict(scene.dims.selection.slice_indices)
-        updated = {a: center[a] for a in center if a in current}
-        if updated and any(current[a] != v for a, v in updated.items()):
-            current.update(updated)
-            viewer.controller.update_slice_indices(scene.id, current)
+        # Panels after the first are usually already mirrored by the axis sync.
+        current = scene.dims.selection.slice_indices
+        if any(current.get(a) != v for a, v in center.items()):
+            viewer.controller.update_slice_indices(scene.id, center)
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +185,7 @@ def build_ortho_layout(
         The layout spec plus the grid widget/view (kept by the caller so it is
         not garbage collected and so a paint tracker can be installed).
     """
-    from cellier.convenience import ChannelControls, Layout
+    from cellier.convenience import AppearanceControls, Layout
     from cellier.convenience.gui import build_ortho_grid_widget
 
     viewer = build.viewer
@@ -329,11 +198,8 @@ def build_ortho_layout(
     # Screen-space 2D orientation axes on each slice panel (both toolkits).
     _add_2d_axis_overlays(viewer)
 
-    docks: dict = {}
-    if build.is_multichannel:
-        docks["left_dock"] = ChannelControls()
-
-    layout = Layout(center=grid, **docks)
+    # The image control drives all four panels' sibling visuals together.
+    layout = Layout(center=grid, left_dock=AppearanceControls())
     return layout, grid
 
 
@@ -353,7 +219,7 @@ def _add_2d_axis_overlays(viewer: OrthoViewer) -> None:
         canvas_ids = controller.get_canvas_ids(scenes[key].id)
         if not canvas_ids:
             continue
-        controller.add_canvas_overlay_model(
+        controller.add_canvas_overlay(
             canvas_ids[0],
             CenteredAxes2D(
                 name=name,
@@ -380,6 +246,7 @@ def launch_orthoviewer(
     theme: str = "dark",
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     perf: StartupPerfTracer | None = None,
     gui: Literal["qt", "anywidget"] = "qt",
 ) -> None:
@@ -399,6 +266,11 @@ def launch_orthoviewer(
     channel_axis : int or None, optional
         Axis index to treat as the channel dimension.  Auto-detected from the
         OME-Zarr metadata when ``None``.
+    infer_multiscale_translations : bool, optional
+        Give the coarser levels the half-voxel offsets of centre-aligned
+        downsampling (e.g. block averages) when the store declares no level
+        translations; warns and keeps the declared ones otherwise.  Default
+        ``False``: wrong for pyramids made by striding.
     perf : StartupPerfTracer or None, optional
         Optional startup performance tracer.
     gui : "qt" or "anywidget"
@@ -429,7 +301,12 @@ def launch_orthoviewer(
     _perf_mark(perf, "viewer.launch.qapp_ready")
 
     QtAsyncio.run(
-        _run_orthoviewer_async(zarr_uri, channel_axis=channel_axis, perf=perf),
+        _run_orthoviewer_async(
+            zarr_uri,
+            channel_axis=channel_axis,
+            infer_multiscale_translations=infer_multiscale_translations,
+            perf=perf,
+        ),
         handle_sigint=True,
     )
 
@@ -438,6 +315,7 @@ async def _run_orthoviewer_async(
     zarr_uri: str,
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     perf: StartupPerfTracer | None = None,
 ) -> None:
     """Build, show, and keep the orthoviewer alive until the window closes."""
@@ -446,7 +324,12 @@ async def _run_orthoviewer_async(
     asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
     _perf_mark(perf, "viewer.async.start")
 
-    handle = _build_and_show_ortho_qt(zarr_uri, channel_axis=channel_axis, perf=perf)
+    handle = _build_and_show_ortho_qt(
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+        perf=perf,
+    )
     _perf_mark(perf, "viewer.async.build_complete")
 
     app = QApplication.instance()
@@ -483,6 +366,7 @@ def _build_and_show_ortho_qt(
     zarr_uri: str,
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     perf: StartupPerfTracer | None = None,
 ) -> _OrthoHandle:
     """Build the Qt orthoviewer window, show it, and arm first-frame startup."""
@@ -494,16 +378,16 @@ def _build_and_show_ortho_qt(
 
     _perf_mark(perf, "viewer.build.start")
     data_store, geometry = extract_viewer_geometry(
-        zarr_uri, channel_axis=channel_axis, perf=perf
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+        perf=perf,
     )
     build = build_ortho_viewer(data_store, geometry, gui="qt")
     _perf_mark(perf, "viewer.build.model_ready")
 
     build.overlays = attach_ortho_overlays(
-        build.viewer,
-        geometry,
-        vol_visual_id=build.vol_visual_id,
-        vol_is_multichannel=build.is_multichannel,
+        build.viewer, geometry, vol_visual_id=build.vol_visual_id
     )
     _perf_mark(perf, "viewer.build.overlays_ready")
 
@@ -512,7 +396,7 @@ def _build_and_show_ortho_qt(
     window.setWindowTitle("OME-Zarr Orthoviewer")
     _perf_mark(perf, "viewer.build.window_ready")
 
-    controls = _attach_qt_controls(build, geometry, window)
+    controls = _attach_qt_controls(build, window)
     _perf_mark(perf, "viewer.build.controls_ready")
 
     handle = _OrthoHandle(
@@ -531,45 +415,28 @@ def _build_and_show_ortho_qt(
     return handle
 
 
-def _attach_qt_controls(
-    build: _OrthoBuild,
-    geometry: _ViewerGeometry,
-    window,
-) -> object:
-    """Bolt oz's Qt-only control panel onto the rendered ``QMainWindow``.
+def _attach_qt_controls(build: _OrthoBuild, window) -> object | None:
+    """Bolt oz's Qt-only overlay panel onto the rendered ``QMainWindow``.
 
-    Single-channel: a full appearance panel on the left dock.  Multichannel:
-    the volume render/opacity groups on the right dock (per-channel controls
-    are already in the layout's left ``ChannelControls`` dock).
+    The image control is already in the layout's left ``AppearanceControls``
+    dock; this adds the overlay toggles on the right.
     """
     from PySide6 import QtWidgets
     from PySide6.QtCore import Qt
 
-    from oz_viewer.viewer._ortho_controls import (
-        build_mc_controls_panel,
-        build_sc_controls_panel,
-    )
+    from oz_viewer.viewer._ortho_controls import build_overlay_controls_panel
 
-    if build.is_multichannel:
-        controls = build_mc_controls_panel(
-            build.viewer.controller, geometry, build.overlays
-        )
-        area = Qt.DockWidgetArea.RightDockWidgetArea
-        title = "Volume"
-    else:
-        controls = build_sc_controls_panel(
-            build.viewer.controller, build.visuals, geometry, build.overlays
-        )
-        area = Qt.DockWidgetArea.LeftDockWidgetArea
-        title = "Rendering"
+    if build.overlays is None:
+        return None
+    controls = build_overlay_controls_panel(build.viewer.controller, build.overlays)
 
-    dock = QtWidgets.QDockWidget(title, window)
+    dock = QtWidgets.QDockWidget("Overlays", window)
     dock.setWidget(controls.widget)
     dock.setFeatures(
         QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable
         | QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetFloatable
     )
-    window.addDockWidget(area, dock)
+    window.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
     return controls
 
 
@@ -634,6 +501,7 @@ def orthoviewer(
     theme: str = "dark",
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
 ) -> _OrthoHandle:
     """Open a Qt orthoviewer window without blocking (IPython / interactive).
 
@@ -658,13 +526,18 @@ def orthoviewer(
             "notebooks, or run inside IPython/Jupyter."
         )
     apply_theme(QApplication.instance(), theme)
-    return _build_and_show_ortho_qt(zarr_uri, channel_axis=channel_axis)
+    return _build_and_show_ortho_qt(
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+    )
 
 
 def display_orthoviewer(
     zarr_uri: str,
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     sidecar: bool = False,
     min_canvas_size: tuple[int, int] | None = None,
 ):
@@ -672,9 +545,8 @@ def display_orthoviewer(
 
     The notebook counterpart of :func:`launch_orthoviewer`.  Returns the cellier
     ``DisplayHandle`` (Jupyter) or the host-native renderable (marimo).  The
-    Qt-only appearance panels are omitted; the four synced panels, the 3D
-    overlays, and (for multichannel data) the ``ChannelControls`` dock render
-    normally.
+    Qt-only overlay panel is omitted; the four synced panels, the 3D overlays,
+    and the image control dock render normally.
 
     Parameters
     ----------
@@ -683,6 +555,11 @@ def display_orthoviewer(
     channel_axis : int or None, optional
         Axis index to treat as the channel dimension.  Auto-detected when
         ``None``.
+    infer_multiscale_translations : bool, optional
+        Give the coarser levels the half-voxel offsets of centre-aligned
+        downsampling (e.g. block averages) when the store declares no level
+        translations; warns and keeps the declared ones otherwise.  Default
+        ``False``: wrong for pyramids made by striding.
     sidecar : bool
         Present the orthoviewer in a ``jupyterlab-sidecar`` tab instead of
         below the cell.  Requires the optional ``sidecar`` package (raises
@@ -697,13 +574,14 @@ def display_orthoviewer(
     """
     from cellier.convenience import display
 
-    data_store, geometry = extract_viewer_geometry(zarr_uri, channel_axis=channel_axis)
+    data_store, geometry = extract_viewer_geometry(
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+    )
     build = build_ortho_viewer(data_store, geometry, gui="anywidget")
     build.overlays = attach_ortho_overlays(
-        build.viewer,
-        geometry,
-        vol_visual_id=build.vol_visual_id,
-        vol_is_multichannel=build.is_multichannel,
+        build.viewer, geometry, vol_visual_id=build.vol_visual_id
     )
     layout, _grid = build_ortho_layout(build, geometry, min_canvas_size=min_canvas_size)
     return display(

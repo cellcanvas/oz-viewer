@@ -157,6 +157,19 @@ def ortho(
             show_default=False,
         ),
     ] = None,
+    infer_multiscale_translations: Annotated[
+        bool,
+        typer.Option(
+            "--infer-multiscale-translations",
+            help=(
+                "Assume the coarser pyramid levels were downsampled centre-aligned"
+                " (e.g. block averages) and add the half-voxel offsets that implies"
+                " when the store declares no level translations. Wrong for"
+                " pyramids made by striding. Ignored, with a warning, when the"
+                " store declares translations."
+            ),
+        ),
+    ] = False,
     theme: Annotated[
         str,
         typer.Option(
@@ -237,7 +250,13 @@ def ortho(
         perf.mark("cli.ortho.uri_resolved", zarr_uri=zarr_uri)
 
     perf.mark("cli.ortho.launch")
-    launch_orthoviewer(zarr_uri, channel_axis=multichannel, theme=theme, perf=perf)
+    launch_orthoviewer(
+        zarr_uri,
+        channel_axis=multichannel,
+        infer_multiscale_translations=infer_multiscale_translations,
+        theme=theme,
+        perf=perf,
+    )
 
 
 @app.command()
@@ -279,6 +298,19 @@ def view(
             show_default=False,
         ),
     ] = None,
+    infer_multiscale_translations: Annotated[
+        bool,
+        typer.Option(
+            "--infer-multiscale-translations",
+            help=(
+                "Assume the coarser pyramid levels were downsampled centre-aligned"
+                " (e.g. block averages) and add the half-voxel offsets that implies"
+                " when the store declares no level translations. Wrong for"
+                " pyramids made by striding. Ignored, with a warning, when the"
+                " store declares translations."
+            ),
+        ),
+    ] = False,
     theme: Annotated[
         str,
         typer.Option(
@@ -359,7 +391,13 @@ def view(
         perf.mark("cli.view.uri_resolved", zarr_uri=zarr_uri)
 
     perf.mark("cli.view.launch")
-    launch_viewer(zarr_uri, channel_axis=multichannel, theme=theme, perf=perf)
+    launch_viewer(
+        zarr_uri,
+        channel_axis=multichannel,
+        infer_multiscale_translations=infer_multiscale_translations,
+        theme=theme,
+        perf=perf,
+    )
 
 
 @app.command(name="theme")

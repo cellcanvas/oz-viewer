@@ -49,7 +49,7 @@ Example viewing https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_A
 
 https://github.com/user-attachments/assets/a6c0cab9-0cd9-4fe0-80c2-c77207b4fd77
 
-You can click the multichannel button in the upper left-hand corner to toggle between single/multichannel rendering. Example viewing the scikit-image cells3d (converted to ome-zarr) multichannel image
+Images with a channel axis open as a composite of their channels (up to 4). Use the "Composite channels" checkbox in the image controls on the left to switch between the composite and single-channel rendering, where a slider steps through the channels. Example viewing the scikit-image cells3d (converted to ome-zarr) multichannel image
 
 https://github.com/user-attachments/assets/b6655863-b8fb-4eea-be84-eb031283494e
 

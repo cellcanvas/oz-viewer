@@ -34,8 +34,6 @@ _AXIS_3D_PRISM_CROSS_SECTION_FRACTION: float = 0.020
 _AXIS_3D_CUBE_COLOUR: tuple[float, float, float, float] = (0.75, 0.75, 0.75, 1.0)
 _N_FACES_PER_BOX: int = 12
 
-_TRANSPARENCY_MODES: list[str] = ["weighted_blend", "weighted_solid", "blend", "add"]
-
 _INITIAL_PLANE_OPACITY: float = 1.0
 
 
@@ -98,22 +96,49 @@ _MIP_AXES_PROFILE = _VisualRenderProfile(
 # ---------------------------------------------------------------------------
 
 
+def _is_mip(render_mode: object) -> bool:
+    """Whether *render_mode* is a maximum-intensity variant."""
+    return str(render_mode) in ("mip", "attenuated_mip")
+
+
 class _VolTransparencyManager:
-    """Manages transparency profiles for each render mode via the model layer."""
+    """Keeps the volume and the overlay meshes blending per render mode.
+
+    The effective render mode is the ``vol`` image's: its single appearance's
+    ``render_mode`` in single mode; in composite mode ``"iso"`` if any held
+    channel renders an isosurface, otherwise ``"mip"``.  It is re-read from
+    the model whenever a render mode or the image's single/composite mode
+    changes, whatever the origin (Qt, anywidget, programmatic).
+
+    In single mode the volume's opacity and blending follow a per-render-mode
+    profile, and edits made through the image control are remembered in the
+    current profile.  A composite hands blending back to cellier (its default
+    follows the mode) and keeps the channels' own opacities; only the meshes
+    follow the render mode there.
+
+    Subscribes through ``controller.connect_widget`` (the widget contract:
+    ``_id``, ``changed``, ``closed``), so the bus rewires it if the image's
+    ``single`` or ``channels`` models are replaced; :meth:`close` unsubscribes.
+    """
+
+    from psygnal import Signal
+
+    #: Required by ``connect_widget``; the manager writes through the
+    #: controller directly, so this never emits.
+    changed = Signal(object)
+    closed = Signal()
 
     def __init__(
         self,
         controller,
         vol_visual_id,
         *,
-        vol_is_multichannel: bool = False,
         plane_visual_id=None,
         axis_visual_ids: list | None = None,
-        initial_mode: str = "iso",
     ) -> None:
+        self._id = uuid4()
         self._controller = controller
         self._vol_visual_id = vol_visual_id
-        self._vol_is_multichannel = vol_is_multichannel
         self._plane_visual_id = plane_visual_id
         self._axis_visual_ids: list = axis_visual_ids or []
         self._vol_profiles: dict[str, _VolTransparencyProfile] = {
@@ -134,9 +159,8 @@ class _VolTransparencyManager:
             "iso": _ISO_AXES_PROFILE,
             "mip": _MIP_AXES_PROFILE,
         }
-        self._current_mode = (
-            initial_mode if initial_mode in self._vol_profiles else "iso"
-        )
+        self._current_mode = self._read_mode()
+        controller.connect_widget(self, subscription_specs=self._subscription_specs())
 
     @property
     def current_mode(self) -> str:
@@ -145,6 +169,73 @@ class _VolTransparencyManager:
     @property
     def current_profile(self) -> _VolTransparencyProfile:
         return self._vol_profiles[self._current_mode]
+
+    def _vol_visual(self):
+        return self._controller.get_visual_model(self._vol_visual_id)
+
+    def _read_mode(self) -> str:
+        visual = self._vol_visual()
+        if visual.composite:
+            modes = [ch.render_mode for ch in visual.channels.values()]
+            return "mip" if all(_is_mip(m) for m in modes) else "iso"
+        return "mip" if _is_mip(visual.single.render_mode) else "iso"
+
+    def _subscription_specs(self) -> list:
+        from cellier.events import (
+            AppearanceChangedEvent,
+            ChannelAppearanceChangedEvent,
+            ImageCompositeChangedEvent,
+            SingleAppearanceChangedEvent,
+            SubscriptionSpec,
+        )
+
+        vid = self._vol_visual_id
+        return [
+            SubscriptionSpec(SingleAppearanceChangedEvent, self._on_single, vid),
+            SubscriptionSpec(ChannelAppearanceChangedEvent, self._on_channel, vid),
+            SubscriptionSpec(ImageCompositeChangedEvent, self._on_composite, vid),
+            SubscriptionSpec(AppearanceChangedEvent, self._on_appearance, vid),
+        ]
+
+    # -- bus handlers --------------------------------------------------------
+
+    def _on_single(self, event) -> None:
+        # field_name is None when the whole single model was replaced.
+        if event.field_name in (None, "render_mode"):
+            self._refresh_mode()
+        elif (
+            event.field_name == "opacity"
+            and event.source_id != self._id
+            and not self._vol_visual().composite
+        ):
+            self.current_profile.opacity = float(event.new_value)
+
+    def _on_channel(self, event) -> None:
+        if event.field_name in (None, "render_mode"):
+            self._refresh_mode()
+
+    def _on_composite(self, event) -> None:
+        # Always re-apply: entering single mode restores the volume profile,
+        # entering composite mode hands blending back to cellier.
+        self._current_mode = self._read_mode()
+        self.apply()
+
+    def _on_appearance(self, event) -> None:
+        if (
+            event.field_name == "transparency_mode"
+            and event.source_id != self._id
+            and event.new_value is not None
+            and not self._vol_visual().composite
+        ):
+            self.current_profile.transparency_mode = str(event.new_value)
+
+    # -- application ---------------------------------------------------------
+
+    def _refresh_mode(self) -> None:
+        new_mode = self._read_mode()
+        if new_mode != self._current_mode:
+            self._current_mode = new_mode
+            self.apply()
 
     def _apply_profile_to_mesh(self, visual_id, profile: _VisualRenderProfile) -> None:
         if visual_id is None:
@@ -159,28 +250,30 @@ class _VolTransparencyManager:
         c.update_appearance_field(visual_id, "opacity", profile.opacity)
 
     def _apply_vol_profile(self) -> None:
-        """Apply the current volume profile via the model layer.
+        """Apply the current volume profile, or hand blending back in composite.
 
-        For multichannel visuals each ChannelAppearance is mutated directly
-        since they share no single .appearance object; the psygnal bridge then
-        routes the changes to the render layer.  For single-channel visuals
-        update_appearance_field is used so source-id threading is preserved.
+        Writes are stamped with the manager's id so the bus handlers can tell
+        them apart from user edits.
         """
+        c = self._controller
         vid = self._vol_visual_id
-        if vid is None:
+        if self._vol_visual().composite:
+            # cellier's defaults: blending follows the mode (None), and the
+            # composite manages depth between its channel volumes itself.
+            c.update_appearance_field(
+                vid, "transparency_mode", None, source_id=self._id
+            )
+            c.update_appearance_field(vid, "depth_write", True, source_id=self._id)
             return
         vol = self.current_profile
         depth_write = vol.transparency_mode == "weighted_solid"
-        if self._vol_is_multichannel:
-            visual = self._controller.get_visual_model(vid)
-            for ch in visual.channels.values():
-                ch.transparency_mode = vol.transparency_mode
-                ch.opacity = vol.opacity
-        else:
-            c = self._controller
-            c.update_appearance_field(vid, "transparency_mode", vol.transparency_mode)
-            c.update_appearance_field(vid, "opacity", vol.opacity)
-            c.update_appearance_field(vid, "depth_write", depth_write)
+        c.update_appearance_field(
+            vid, "transparency_mode", vol.transparency_mode, source_id=self._id
+        )
+        c.update_appearance_field(vid, "depth_write", depth_write, source_id=self._id)
+        c.update_single_appearance_field(
+            vid, "opacity", vol.opacity, source_id=self._id
+        )
 
     def apply(self) -> None:
         self._apply_vol_profile()
@@ -190,22 +283,9 @@ class _VolTransparencyManager:
         for vid in self._axis_visual_ids:
             self._apply_profile_to_mesh(vid, axes_profile)
 
-    def on_render_mode_changed(self, new_mode: str) -> None:
-        if new_mode in self._vol_profiles:
-            self._current_mode = new_mode
-        elif new_mode.startswith("mip"):
-            self._current_mode = "mip"
-        else:
-            self._current_mode = "iso"
-        self.apply()
-
-    def update_transparency_mode(self, transparency_mode: str) -> None:
-        self.current_profile.transparency_mode = transparency_mode
-        self.apply()
-
-    def update_opacity(self, opacity: float) -> None:
-        self.current_profile.opacity = opacity
-        self.apply()
+    def close(self) -> None:
+        """Unsubscribe from the controller bus."""
+        self.closed.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -341,21 +421,30 @@ def _spatial_mesh_store(
 ):
     """A face-coloured mesh store over the three spatial world axes only.
 
-    Its axes copy the world's spatial axes (name, type, unit), so
-    :func:`_mesh_to_world` can map them one to one.
+    Its axes copy the world's spatial axes (name, type, unit) with fresh ids,
+    so :func:`_mesh_to_world` can map them one to one.  The coordinate system
+    is built here rather than derived when the mesh is added, because the
+    transform that places the mesh is built against it first.
     """
     from cellier.data.mesh import MeshMemoryStore
+    from cellier.transform import Axis, DataCoordinateSystem
 
     zyx = [world.axes[axis] for axis in spatial_axes]
+    system = DataCoordinateSystem(
+        name=f"{name}_data",
+        axes=tuple(
+            Axis(name=axis.name, axis_type=axis.axis_type, unit=axis.unit)
+            for axis in zyx
+        ),
+        datastore_id=uuid4(),
+    )
     return MeshMemoryStore(
         positions=positions_zyx,
         indices=indices,
         colors=colors,
         colors_layout="face",
         name=name,
-        axis_names=[axis.name for axis in zyx],
-        axis_types=[axis.axis_type for axis in zyx],
-        axis_units=[axis.unit for axis in zyx],
+        data_coordinate_systems=[system],
     )
 
 
@@ -703,21 +792,10 @@ class OrthoOverlays:
     _orientation_updater: _OrientationUpdater
     _owner_ids: list
     _controller: object
-    _render_mode_callback: object | None = None
-    _vol_appearance_events: object | None = None
 
     def close(self) -> None:
-        """Unsubscribe every overlay owner and detach the render-mode observer."""
-        if (
-            self._render_mode_callback is not None
-            and self._vol_appearance_events is not None
-        ):
-            try:
-                self._vol_appearance_events.render_mode.disconnect(
-                    self._render_mode_callback
-                )
-            except (ValueError, RuntimeError):
-                pass
+        """Unsubscribe every overlay owner, the transparency manager included."""
+        self.transparency_manager.close()
         for owner_id in self._owner_ids:
             self._controller.unsubscribe_owner(owner_id)
 
@@ -727,7 +805,6 @@ def attach_ortho_overlays(
     geometry: _ViewerGeometry,
     *,
     vol_visual_id,
-    vol_is_multichannel: bool,
 ) -> OrthoOverlays:
     """Attach the slice-plane, orientation, and transparency overlays.
 
@@ -743,10 +820,8 @@ def attach_ortho_overlays(
     geometry : _ViewerGeometry
         OME-Zarr geometry (spatial axes, world extents, channel axis).
     vol_visual_id :
-        The image visual id in the ``vol`` scene the transparency manager owns.
-    vol_is_multichannel : bool
-        Whether the ``vol`` visual is a multichannel visual (locks the
-        transparency manager to MIP and mutates each ``ChannelAppearance``).
+        The image visual id in the ``vol`` scene the transparency manager
+        follows; it tracks the image's single/composite mode live.
 
     Returns
     -------
@@ -808,28 +883,14 @@ def attach_ortho_overlays(
     )
 
     # --- volume transparency manager ---
+    # Follows the vol image's render mode and single/composite mode from any
+    # origin (Qt, anywidget, programmatic) through the controller bus.
     transparency_manager = _VolTransparencyManager(
         controller,
         vol_visual_id,
-        vol_is_multichannel=vol_is_multichannel,
         plane_visual_id=plane_visual.id,
         axis_visual_ids=axis_visual_ids,
-        initial_mode="mip" if vol_is_multichannel else "iso",
     )
-
-    render_mode_callback = None
-    vol_appearance_events = None
-    if not vol_is_multichannel:
-        # Observe the evented appearance model directly so the transparency
-        # profile tracks render_mode changes from any origin (Qt, anywidget,
-        # programmatic) with no widget-signal plumbing (conversion plan D4.4).
-        vol_visual = controller.get_visual_model(vol_visual_id)
-        vol_appearance_events = vol_visual.appearance.events
-
-        def render_mode_callback(new_mode) -> None:
-            transparency_manager.on_render_mode_changed(str(new_mode))
-
-        vol_appearance_events.render_mode.connect(render_mode_callback)
     transparency_manager.apply()
 
     # --- orientation updater (camera + dims driven) ---
@@ -903,6 +964,4 @@ def attach_ortho_overlays(
         _orientation_updater=orient_updater,
         _owner_ids=owner_ids,
         _controller=controller,
-        _render_mode_callback=render_mode_callback,
-        _vol_appearance_events=vol_appearance_events,
     )

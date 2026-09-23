@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import functools
+import sys
 import threading
 import time
+import weakref
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from typing import TYPE_CHECKING, Literal
 
@@ -13,6 +15,48 @@ import pytest
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
     from pathlib import Path
+
+
+@pytest.fixture(autouse=True)
+def _close_cellier_controllers(monkeypatch):
+    """Close every ``CellierController`` a test creates.
+
+    A controller owns render canvases and GPU resources that the GUI backend
+    holds, not Python refcounting.  A test that only closes its window leaves
+    them to the garbage collector, which may run their teardown at any later
+    moment on any thread -- including inside zarr's I/O thread while a later
+    test writes an example store, which then deadlocks.  Mirrors cellier's own
+    test teardown.
+    """
+    from cellier.controller import CellierController
+
+    created: list[weakref.ref] = []
+    original_init = CellierController.__init__
+
+    def _tracking_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        created.append(weakref.ref(self))
+
+    monkeypatch.setattr(CellierController, "__init__", _tracking_init)
+
+    yield
+
+    for ref in created:
+        controller = ref()
+        if controller is None:
+            continue
+        try:
+            controller.close()
+        except Exception:
+            # Teardown must not turn a passing test into an error.
+            pass
+
+    # Qt deletes a closed widget only when the event loop next runs.
+    widgets_module = sys.modules.get("PySide6.QtWidgets")
+    if widgets_module is not None:
+        app = widgets_module.QApplication.instance()
+        if app is not None:
+            app.processEvents()
 
 
 @pytest.fixture

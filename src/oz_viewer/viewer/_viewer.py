@@ -2,12 +2,13 @@
 
 Rebuilt on top of :mod:`cellier.convenience`, so the same builder runs under
 both ``gui="qt"`` (desktop / CLI) and ``gui="anywidget"`` (Jupyter / marimo).
-Appearance controls and per-channel controls are provided by cellier's
-cross-toolkit ``Layout`` docks and the 2D/3D toggle by the dims control
-embedded in the canvas view; this module only supplies the
-OME-Zarr-specific geometry (see :mod:`oz_viewer.viewer._geometry`) and the
-Qt-specific launch niceties oz-viewer cares about (theme, fsspec loop, asyncio
-exception handling, startup perf tracing).
+The image control (both single and composite modes, and the switch between
+them) comes from cellier's cross-toolkit ``AppearanceControls`` dock and the
+2D/3D toggle from the dims control embedded in the canvas view; this module
+only supplies the OME-Zarr-specific geometry (see
+:mod:`oz_viewer.viewer._geometry`) and the Qt-specific launch niceties
+oz-viewer cares about (theme, fsspec loop, asyncio exception handling, startup
+perf tracing).
 """
 
 from __future__ import annotations
@@ -16,13 +17,13 @@ import asyncio
 from typing import TYPE_CHECKING, Literal
 
 from oz_viewer.viewer._geometry import _ViewerGeometry, extract_viewer_geometry
+from oz_viewer.viewer._image import controller_render_config, image_visual_kwargs
 from oz_viewer.viewer._utils import (
     _asyncio_exception_handler,
     _ensure_qt_app,
     _perf_mark,
     _sidecar_options,
 )
-from oz_viewer.viewer._widgets import _DEFAULT_COLORMAPS
 
 if TYPE_CHECKING:
     from cellier.convenience import Viewer
@@ -31,44 +32,7 @@ if TYPE_CHECKING:
 
     from oz_viewer._perf import StartupPerfTracer
 
-# Appearance fields exposed in the single-channel appearance dock, in order.
-_APPEARANCE_FIELDS = [
-    "color_map",
-    "clim",
-    "render_mode",
-    "iso_threshold",
-    "attenuation",
-    "lod_bias",
-]
-# Per-channel fields exposed in the multichannel dock, in order.
-_CHANNEL_FIELDS = ["visible", "color_map", "clim", "opacity"]
-
 _INITIAL_LOD_BIAS = 1.5
-
-
-def _render_config() -> object:
-    """The controller render-pipeline config used by both viewers."""
-    from cellier.render import (
-        RenderManagerConfig,
-        SlicingConfig,
-        TemporalAccumulationConfig,
-    )
-
-    return RenderManagerConfig(
-        slicing=SlicingConfig(batch_size=32, render_every=4),
-        temporal=TemporalAccumulationConfig(enabled=False),
-    )
-
-
-def _visual_render_config() -> object:
-    """LOD / GPU-budget config for the single-panel multiscale visual."""
-    from cellier.visuals import MultiscaleImageRenderConfig
-
-    return MultiscaleImageRenderConfig(
-        block_size=32,
-        gpu_budget_bytes=2048 * 1024**2,
-        gpu_budget_bytes_2d=64 * 1024**2,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -84,9 +48,9 @@ def build_viewer(
 ) -> Viewer:
     """Build a :class:`cellier.convenience.Viewer` for an OME-Zarr store.
 
-    Chooses a single-channel or multichannel visual at build time based on
-    whether *geometry* found a channel axis (D1 in the conversion plan): there
-    is no runtime single<->multichannel toggle.
+    Adds one multiscale image visual.  When *geometry* found a channel axis
+    the visual starts in composite mode; the image control switches it to
+    single mode (and back) at runtime.
 
     Parameters
     ----------
@@ -106,112 +70,25 @@ def build_viewer(
     viewer = Viewer(
         geometry.world,
         dim="2d",
-        render_config=_render_config(),
+        render_config=controller_render_config(),
         gui=gui,
     )
     viewer.controller.camera_reslice_enabled = True
     viewer.controller.camera_settle_threshold_s = 0.3
 
-    if geometry.channel_axis is not None:
-        _add_multichannel_visual(viewer, data_store, geometry)
-    else:
-        _add_single_channel_visual(viewer, data_store, geometry)
-
-    # Center the sliced spatial axis (e.g. Z) at the volume midpoint; extra
-    # axes such as channel keep their default position of 0.
-    center = geometry.center_slice_indices()
-    current = dict(viewer.scene.dims.selection.slice_indices)
-    updated = {a: center[a] for a in center if a in current}
-    if updated:
-        current.update(updated)
-        viewer.controller.update_slice_indices(viewer.scene.id, current)
-
-    return viewer
-
-
-def _add_single_channel_visual(
-    viewer: Viewer,
-    data_store: OMEZarrImageDataStore,
-    geometry: _ViewerGeometry,
-) -> None:
-    """Add a single-channel multiscale image visual + appearance controls."""
-    from cellier.convenience import MultiscaleImageControlsConfig
-    from cellier.visuals import MultiscaleImageAppearance
-
-    clim_max = geometry.initial_clim_max
     viewer.add_image_multiscale(
         data_store,
-        appearance=MultiscaleImageAppearance(
-            color_map="viridis",
-            clim=(0.0, clim_max),
-            lod_bias=_INITIAL_LOD_BIAS,
-            iso_threshold=clim_max / 2.0,
-            render_mode="mip",
-            attenuation=1.0,
-        ),
         name="volume",
-        render_config=_visual_render_config(),
-        transform=geometry.voxel_to_world,
-        controls=MultiscaleImageControlsConfig(
-            appearance=_APPEARANCE_FIELDS,
-            colormap_names=_DEFAULT_COLORMAPS,
-            clim_range=geometry.clim_range,
-        ),
+        **image_visual_kwargs(geometry, render_mode="mip", lod_bias=_INITIAL_LOD_BIAS),
     )
 
-
-def _add_multichannel_visual(
-    viewer: Viewer,
-    data_store: OMEZarrImageDataStore,
-    geometry: _ViewerGeometry,
-) -> None:
-    """Add a multichannel multiscale visual + per-channel controls.
-
-    The channel axis is moved to ``stacked_axes`` so it renders as a stack (all
-    channels at once) and no redundant dims slider appears for it -- the
-    ``ChannelControls`` dock owns per-channel visibility instead.
-    """
-    from cellier.convenience import ChannelControlsConfig
-    from cellier.visuals import ChannelAppearance
-
-    clim_max = geometry.initial_clim_max
-    channel_axis = geometry.channel_axis
-    assert channel_axis is not None
-    n = geometry.n_channels
-    # Start every channel visible; the ChannelControls dock toggles from there.
-    channels = {
-        i: ChannelAppearance(
-            color_map=_DEFAULT_COLORMAPS[i % len(_DEFAULT_COLORMAPS)],
-            clim=(0.0, clim_max),
-            visible=True,
-        )
-        for i in range(n)
-    }
-    # Raise the channel-node budget to cover every channel so construction and
-    # the ChannelControls dock never exceed the cap for real (few-channel) data.
-    max_channels = max(8, n)
-    viewer.add_multichannel_image_multiscale(
-        data_store,
-        channel_axis=channel_axis,
-        channels=channels,
-        name="multichannel_volume",
-        render_config=_visual_render_config(),
-        transform=geometry.voxel_to_world,
-        max_channels_2d=max_channels,
-        max_channels_3d=max_channels,
-        controls=ChannelControlsConfig(
-            fields=_CHANNEL_FIELDS,
-            colormap_names=_DEFAULT_COLORMAPS,
-            clim_range=geometry.clim_range,
-        ),
+    # Center the spatial axes at the volume midpoint; extra axes such as
+    # channel keep their default position of 0.  update_slice_indices merges.
+    viewer.controller.update_slice_indices(
+        viewer.scene.id, geometry.center_slice_indices()
     )
 
-    # Stack the channel axis: drop it from slice_indices and mark it stacked so
-    # the multichannel visual renders every channel and no slider is shown.
-    current = dict(viewer.scene.dims.selection.slice_indices)
-    current.pop(channel_axis, None)
-    viewer.controller.update_slice_indices(viewer.scene.id, current)
-    viewer.controller.set_stacked_axes(viewer.scene.id, (channel_axis,))
+    return viewer
 
 
 def build_viewer_layout(
@@ -239,7 +116,7 @@ def build_viewer_layout(
         The layout spec plus the canvas view/widget (kept by the caller so it
         can install a paint tracker or avoid GC).
     """
-    from cellier.convenience import AppearanceControls, ChannelControls, Layout
+    from cellier.convenience import AppearanceControls, Layout
     from cellier.convenience.gui import build_canvas_widget
 
     canvas_view = build_canvas_widget(
@@ -249,15 +126,10 @@ def build_viewer_layout(
         canvas_size=min_canvas_size,
     )
 
-    # Left dock: per-channel controls for multichannel data, otherwise the
-    # single-channel appearance panel.  The 2D/3D toggle needs no dock of its
-    # own -- cellier embeds it in the canvas view's dims control.
-    if geometry.channel_axis is not None:
-        left: object = ChannelControls()
-    else:
-        left = AppearanceControls()
-
-    layout = Layout(center=canvas_view, left_dock=left)
+    # Left dock: the image control, which holds both modes and the switch
+    # between them.  The 2D/3D toggle needs no dock of its own -- cellier
+    # embeds it in the canvas view's dims control.
+    layout = Layout(center=canvas_view, left_dock=AppearanceControls())
     return layout, canvas_view
 
 
@@ -271,6 +143,7 @@ def launch_viewer(
     theme: str = "dark",
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     perf: StartupPerfTracer | None = None,
     gui: Literal["qt", "anywidget"] = "qt",
 ) -> None:
@@ -290,6 +163,11 @@ def launch_viewer(
     channel_axis : int or None, optional
         Axis index to treat as the channel dimension.  Auto-detected from the
         OME-Zarr metadata when ``None``.
+    infer_multiscale_translations : bool, optional
+        Give the coarser levels the half-voxel offsets of centre-aligned
+        downsampling (e.g. block averages) when the store declares no level
+        translations; warns and keeps the declared ones otherwise.  Default
+        ``False``: wrong for pyramids made by striding.
     perf : StartupPerfTracer or None, optional
         Optional startup performance tracer.
     gui : "qt" or "anywidget"
@@ -321,7 +199,12 @@ def launch_viewer(
     _perf_mark(perf, "viewer.launch.qapp_ready")
 
     QtAsyncio.run(
-        _run_viewer_async(zarr_uri, channel_axis=channel_axis, perf=perf),
+        _run_viewer_async(
+            zarr_uri,
+            channel_axis=channel_axis,
+            infer_multiscale_translations=infer_multiscale_translations,
+            perf=perf,
+        ),
         handle_sigint=True,
     )
 
@@ -330,6 +213,7 @@ async def _run_viewer_async(
     zarr_uri: str,
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     perf: StartupPerfTracer | None = None,
 ) -> None:
     """Build, show, and keep the viewer alive until the window closes."""
@@ -338,7 +222,12 @@ async def _run_viewer_async(
     asyncio.get_event_loop().set_exception_handler(_asyncio_exception_handler)
     _perf_mark(perf, "viewer.async.start")
 
-    holder = _build_and_show_viewer_qt(zarr_uri, channel_axis=channel_axis, perf=perf)
+    holder = _build_and_show_viewer_qt(
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+        perf=perf,
+    )
     _perf_mark(perf, "viewer.async.build_complete")
 
     app = QApplication.instance()
@@ -365,6 +254,7 @@ def _build_and_show_viewer_qt(
     zarr_uri: str,
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     perf: StartupPerfTracer | None = None,
 ) -> _ViewerHandle:
     """Build the Qt viewer window, show it, and arm first-frame startup."""
@@ -377,7 +267,10 @@ def _build_and_show_viewer_qt(
 
     _perf_mark(perf, "viewer.build.start")
     data_store, geometry = extract_viewer_geometry(
-        zarr_uri, channel_axis=channel_axis, perf=perf
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+        perf=perf,
     )
     viewer = build_viewer(data_store, geometry, gui="qt")
     _perf_mark(perf, "viewer.build.model_ready")
@@ -440,6 +333,7 @@ def viewer(
     theme: str = "dark",
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
 ) -> _ViewerHandle:
     """Open a Qt viewer window without blocking (IPython / interactive).
 
@@ -464,13 +358,18 @@ def viewer(
             "or run inside IPython/Jupyter."
         )
     apply_theme(QApplication.instance(), theme)
-    return _build_and_show_viewer_qt(zarr_uri, channel_axis=channel_axis)
+    return _build_and_show_viewer_qt(
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+    )
 
 
 def display_viewer(
     zarr_uri: str,
     *,
     channel_axis: int | None = None,
+    infer_multiscale_translations: bool = False,
     sidecar: bool = False,
     min_canvas_size: tuple[int, int] | None = None,
 ):
@@ -486,6 +385,11 @@ def display_viewer(
     channel_axis : int or None, optional
         Axis index to treat as the channel dimension.  Auto-detected when
         ``None``.
+    infer_multiscale_translations : bool, optional
+        Give the coarser levels the half-voxel offsets of centre-aligned
+        downsampling (e.g. block averages) when the store declares no level
+        translations; warns and keeps the declared ones otherwise.  Default
+        ``False``: wrong for pyramids made by striding.
     sidecar : bool
         Present the viewer in a ``jupyterlab-sidecar`` tab instead of below
         the cell.  Requires the optional ``sidecar`` package (raises
@@ -501,7 +405,11 @@ def display_viewer(
     """
     from cellier.convenience import display
 
-    data_store, geometry = extract_viewer_geometry(zarr_uri, channel_axis=channel_axis)
+    data_store, geometry = extract_viewer_geometry(
+        zarr_uri,
+        channel_axis=channel_axis,
+        infer_multiscale_translations=infer_multiscale_translations,
+    )
     v = build_viewer(data_store, geometry, gui="anywidget")
     layout, _canvas_view = build_viewer_layout(
         v, geometry, min_canvas_size=min_canvas_size

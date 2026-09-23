@@ -1,8 +1,9 @@
 """Headless build tests for the convenience-based orthoviewer.
 
 These exercise the full Qt build path (``_build_and_show_ortho_qt``) offscreen:
-the four synced panels, the build-time single/multichannel choice, the
-re-attached 3D overlays, and the Qt control docks.  A live GPU render is not
+the four synced panels, the image's starting mode and the runtime switch
+between modes, the re-attached 3D overlays, and the control docks.  A live GPU
+render is not
 exercised (there is no display in CI), only construction.
 """
 
@@ -45,7 +46,7 @@ def _dock_control_names(window, title: str) -> set[str]:
 
 
 def test_single_channel_ortho_build(qapp, tmp_path):
-    """Blobs (z,y,x) -> single-channel ortho: 4 panels, overlays, Rendering dock."""
+    """Blobs (z,y,x) -> single-mode ortho: 4 panels, overlays, both docks."""
     from oz_viewer.data._blobs import make_example_zarr
     from oz_viewer.viewer._orthoviewer import _build_and_show_ortho_qt
 
@@ -53,9 +54,14 @@ def test_single_channel_ortho_build(qapp, tmp_path):
     handle = _build_and_show_ortho_qt(f"file://{zarr_path}")
     try:
         build = handle.build
-        assert build.is_multichannel is False
         assert set(build.visuals) == {"xy", "xz", "yz", "vol"}
         assert set(build.viewer.scenes) == {"xy", "xz", "yz", "vol"}
+        assert not any(v.composite for v in build.visuals.values())
+
+        # One linked appearance; only the vol panel's LOD policy differs.
+        assert build.visuals["vol"].appearance.force_level is not None
+        assert build.visuals["vol"].appearance.frustum_cull is False
+        assert build.visuals["xy"].appearance.force_level is None
 
         # Overlays attached: plane + three orientation-axis meshes, ISO profile.
         overlays = build.overlays
@@ -73,34 +79,40 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         gizmo = controller.get_visual_model(overlays.axis_visual_ids[0])
         assert gizmo.transform.translation[z_axis] == pytest.approx(12.3)
 
-        # Qt-only appearance panel on the left dock; no channel dock.
-        assert "Rendering" in _dock_titles(handle.window)
+        # The image control (both toolkits) plus the Qt-only overlay panel.
+        titles = _dock_titles(handle.window)
+        assert "Left" in titles
+        assert "Overlays" in titles
+        names = _dock_control_names(handle.window, "Left")
+        assert {"Contrast", "Colormap", "Render mode", "LOD bias"} <= names
     finally:
         handle.close()
 
 
 def test_multichannel_ortho_build(qapp, write_demo_ome):
-    """Demo image (c,z,y,x) -> multichannel ortho: channel stacked, both docks."""
+    """Demo image (c,z,y,x) -> composite ortho, switchable to single at runtime."""
     from oz_viewer.viewer._orthoviewer import _build_and_show_ortho_qt
 
     zarr_path = write_demo_ome("image")
     handle = _build_and_show_ortho_qt(f"file://{zarr_path}")
     try:
         build = handle.build
-        assert build.is_multichannel is True
+        viewer = build.viewer
+        controller = viewer.controller
         assert set(build.visuals) == {"xy", "xz", "yz", "vol"}
+        assert all(v.composite for v in build.visuals.values())
 
-        # Channel axis (0) is stacked, not sliced, so no channel slider remains.
-        for scene in build.viewer.scenes.values():
-            assert 0 not in scene.dims.selection.slice_indices
+        # A composited channel axis (0) has no slider on any panel.
+        for scene in viewer.scenes.values():
+            assert 0 not in scene.slider_axes
 
-        # Multichannel volume is locked to MIP; overlays present.
-        assert build.overlays.transparency_manager.current_mode == "mip"
+        # Composite channels render MIP, so the overlays use the MIP profile.
+        manager = build.overlays.transparency_manager
+        assert manager.current_mode == "mip"
 
         # The overlay meshes are 3-D (z, y, x) and broadcast over the channel
         # axis, so they exist at every channel without per-channel updates.
-        controller = build.viewer.controller
-        world = build.viewer.scenes["vol"].dims.world_coordinate_system
+        world = viewer.scenes["vol"].dims.world_coordinate_system
         overlay_ids = (build.overlays.plane_visual.id, *build.overlays.axis_visual_ids)
         for visual_id in overlay_ids:
             transform = controller.get_visual_model(visual_id).transform
@@ -111,18 +123,43 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
 
         axis_values = handle.geometry.axis_values
         assert axis_values[0] == DiscreteAxisValues(
-            values=tuple(float(i) for i in range(handle.geometry.n_channels))
+            values=tuple(float(i) for i in range(handle.geometry.n_channels)),
+            labels=handle.geometry.channel_labels,
         )
         assert all(isinstance(axis_values[a], ContinuousAxisValues) for a in (1, 2, 3))
 
-        # ChannelControls dock ("Left") plus the Qt-only volume group ("Volume").
+        # The image control on the left drives all four panels; the overlay
+        # panel on the right.
         titles = _dock_titles(handle.window)
         assert "Left" in titles
-        assert "Volume" in titles
-
-        # The channel dock drives all four panels' sibling visuals, so it must
-        # actually hold one group per channel -- not just exist.
+        assert "Overlays" in titles
         names = _dock_control_names(handle.window, "Left")
         assert {f"Channel {i}" for i in range(handle.geometry.n_channels)} <= names
+        assert "Composite channels" in names
+
+        # Runtime switch to single mode: every panel follows, the channel axis
+        # gets a slider, and the manager picks up the single ISO render mode
+        # and applies its volume profile.
+        vol_id = build.vol_visual_id
+        viewer.set_image_composite(build.visuals, False)
+        assert not any(v.composite for v in build.visuals.values())
+        for scene in viewer.scenes.values():
+            assert 0 in scene.slider_axes
+        assert manager.current_mode == "iso"
+        vol = controller.get_visual_model(vol_id)
+        assert vol.single.opacity == pytest.approx(manager.current_profile.opacity)
+        assert vol.appearance.transparency_mode == "weighted_blend"
+
+        # An opacity edit through the image group is remembered per mode.
+        viewer.update_image_single_field(build.visuals, "opacity", 0.6)
+        assert manager.current_profile.opacity == pytest.approx(0.6)
+
+        # Back to composite: blending returns to cellier's default, and the
+        # remembered ISO profile is re-applied on the next switch to single.
+        viewer.set_image_composite(build.visuals, True)
+        assert manager.current_mode == "mip"
+        assert vol.appearance.transparency_mode is None
+        viewer.set_image_composite(build.visuals, False)
+        assert vol.single.opacity == pytest.approx(0.6)
     finally:
         handle.close()

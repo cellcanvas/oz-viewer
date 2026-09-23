@@ -10,7 +10,8 @@ single-panel viewer and the orthoviewer.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, NamedTuple
+import warnings
+from typing import TYPE_CHECKING, Literal, NamedTuple
 
 import numpy as np
 
@@ -32,6 +33,8 @@ class _ViewerGeometry(NamedTuple):
     spatial_ndim: int
     channel_axis: int | None
     n_channels: int
+    #: One name per channel from the store's ``omero`` metadata, or ``None``.
+    channel_labels: tuple[str, ...] | None
     #: The world every scene shares, with the store's axis names, types and
     #: units.  Pass this exact object to the viewer: a transform names its
     #: endpoints by id, so an equal-looking world built elsewhere is rejected.
@@ -70,7 +73,10 @@ class _ViewerGeometry(NamedTuple):
         """World-space slider values per axis, for the dims sliders.
 
         The channel axis is discrete -- one stop per channel, so its slider
-        never rests between two channels.  Every other axis (spatial, time) is
+        never rests between two channels -- and named by the ``omero`` channel
+        labels when the store has them.  It only shows a slider while the image
+        is in single mode; a composite draws every channel at once.  Every
+        other axis (spatial, time) is
         continuous over ``[0, world_max]``, from the first voxel centre to the
         last.  Derived from the metadata rather than via
         ``cellier.convenience.axis_values_from_viewer``, which widens each axis
@@ -83,7 +89,8 @@ class _ViewerGeometry(NamedTuple):
             if axis == self.channel_axis:
                 step = float(self.level_0_scale[axis])
                 values[axis] = DiscreteAxisValues(
-                    values=tuple(i * step for i in range(self.n_channels))
+                    values=tuple(i * step for i in range(self.n_channels)),
+                    labels=self.channel_labels,
                 )
             else:
                 values[axis] = ContinuousAxisValues(
@@ -110,6 +117,7 @@ def extract_viewer_geometry(
     channel_axis: int | None = None,
     perf: StartupPerfTracer | None = None,
     print_summary: bool = True,
+    infer_multiscale_translations: bool = False,
 ) -> tuple[OMEZarrImageDataStore, _ViewerGeometry]:
     """Open an OME-Zarr store and extract the geometry the viewers need.
 
@@ -119,41 +127,64 @@ def extract_viewer_geometry(
         Path or URI to the OME-Zarr store.
     channel_axis : int or None, optional
         Axis index to treat as the channel dimension.  When ``None`` (default),
-        the channel axis is auto-detected from the OME-Zarr axis metadata.
+        the channel axis is auto-detected from the store's axis types.
     perf : StartupPerfTracer or None, optional
         Optional startup performance tracer.
     print_summary : bool, optional
         Print a Rich table summarizing the store's metadata.  Default ``True``.
+    infer_multiscale_translations : bool, optional
+        Assume the coarser levels were downsampled centre-aligned (e.g. block
+        averages) and give each the half-voxel offset that implies, when the
+        store declares no level translations.  See
+        :func:`_with_inferred_level_translations`.  Default ``False``: wrong
+        for pyramids made by striding.
 
     Returns
     -------
     tuple[OMEZarrImageDataStore, _ViewerGeometry]
     """
-    import yaozarrs
     from cellier.data.image import OMEZarrImageDataStore
 
     _perf_mark(perf, "geometry.start", zarr_uri=zarr_uri)
     data_store = OMEZarrImageDataStore.from_path(zarr_uri)
     _perf_mark(perf, "geometry.data_store_ready", n_levels=data_store.n_levels)
 
-    group = yaozarrs.open_group(data_store.zarr_path)
-    ome_image = group.ome_metadata()
-    ms = ome_image.multiscales[data_store.multiscale_index]
+    translations: _TranslationSource = (
+        "declared" if _has_level_translations(data_store) else "none"
+    )
+    if infer_multiscale_translations:
+        if translations == "declared":
+            warnings.warn(
+                f"{zarr_uri} already declares multiscale level translations; "
+                "--infer-multiscale-translations is ignored and the declared "
+                "translations are used.",
+                UserWarning,
+                stacklevel=2,
+            )
+        else:
+            data_store = _with_inferred_level_translations(data_store)
+            translations = "inferred"
+            _perf_mark(perf, "geometry.level_translations_inferred")
 
-    n_dims = len(data_store.level_shapes[0])
+    # The level-0 coordinate system is the store's record of its axis names,
+    # types and units, parsed from the NGFF metadata at construction.
+    data_axes = data_store.data_coordinate_systems[0].axes
+    n_dims = len(data_axes)
 
-    # Detect channel axis from OME-Zarr axis metadata when not explicitly set.
+    # Detect the channel axis from the axis types when not explicitly set.
     if channel_axis is None:
-        for idx, ax in enumerate(ms.axes):
-            if getattr(ax, "type", None) == "channel":
+        for idx, ax in enumerate(data_axes):
+            if ax.axis_type == "channel":
                 channel_axis = idx
                 break
 
     spatial_indices: list[int] = [i for i in range(n_dims) if i != channel_axis]
     spatial_ndim = len(spatial_indices)
 
+    # The level-0 data -> world scale: the multiscale's global scale composed
+    # with the finest dataset's, as the store parsed it.
     level_0_scale_full = np.array(
-        ms.datasets[0].scale_transform.scale, dtype=np.float64
+        data_store.physical_scale or [1.0] * n_dims, dtype=np.float64
     )
     level_0_scale_spatial = level_0_scale_full[spatial_indices]
 
@@ -175,6 +206,7 @@ def extract_viewer_geometry(
             level_0_scale_spatial,
             world_extents_spatial,
             depth_range,
+            translations,
         )
         _perf_mark(perf, "geometry.metadata_printed")
 
@@ -185,13 +217,18 @@ def extract_viewer_geometry(
     n_channels = (
         int(data_store.level_shapes[0][channel_axis]) if channel_axis is not None else 0
     )
+    labels = data_store.channel_labels
+    channel_labels = (
+        tuple(labels) if labels is not None and len(labels) == n_channels else None
+    )
 
     geometry = _ViewerGeometry(
-        axis_names=tuple(data_store.axis_names),
+        axis_names=tuple(ax.name for ax in data_axes),
         spatial_indices=spatial_indices,
         spatial_ndim=spatial_ndim,
         channel_axis=channel_axis,
         n_channels=n_channels,
+        channel_labels=channel_labels,
         world=world,
         voxel_to_world=voxel_to_world,
         level_0_scale=level_0_scale_full,
@@ -204,6 +241,55 @@ def extract_viewer_geometry(
     )
     _perf_mark(perf, "geometry.ready")
     return data_store, geometry
+
+
+#: Where the store's level translations came from, for the metadata table.
+_TranslationSource = Literal["declared", "inferred", "none"]
+
+#: Store fields cellier derives at construction, so a rebuilt store must not
+#: carry them over: the id comes from the coordinate systems, and the level
+#: transforms from the level scales and translations.
+_DERIVED_STORE_FIELDS = frozenset({"id", "level_transforms", "store_type"})
+
+
+def _has_level_translations(data_store: OMEZarrImageDataStore) -> bool:
+    """Whether any level of *data_store* is offset from level 0."""
+    return any(
+        any(float(value) != 0.0 for value in translation)
+        for translation in data_store.level_translations
+    )
+
+
+def _inferred_level_translations(
+    level_scales: list[tuple[float, ...]],
+) -> list[tuple[float, ...]]:
+    """Half-voxel offsets of centre-aligned downsampling, per level and axis.
+
+    A level-k voxel that averages ``f`` level-0 voxels along an axis starts at
+    level-0 voxel 0, so its centre sits at level-0 index ``(f - 1) / 2``.  The
+    result is in level-0 voxels, the units of ``level_translations``.  An axis
+    that is not downsampled (``f == 1``) gets 0, and so does level 0.
+    """
+    return [tuple((float(f) - 1.0) / 2.0 for f in scale) for scale in level_scales]
+
+
+def _with_inferred_level_translations(
+    data_store: OMEZarrImageDataStore,
+) -> OMEZarrImageDataStore:
+    """Rebuild *data_store* with the centre-aligned level translations.
+
+    Goes through the public constructor so cellier rebuilds the level
+    transforms from the new translations; every other field is copied, so a
+    field cellier adds later is carried over too.  Level 0 is untouched, so
+    the store sits in the world exactly where it did.
+    """
+    fields = {
+        name: getattr(data_store, name)
+        for name in type(data_store).model_fields
+        if name not in _DERIVED_STORE_FIELDS and name != "level_translations"
+    }
+    fields["level_translations"] = _inferred_level_translations(data_store.level_scales)
+    return type(data_store)(**fields)
 
 
 def _world_and_transform(
@@ -219,19 +305,14 @@ def _world_and_transform(
     """
     from cellier.transform import AffineTransform, Axis, WorldCoordinateSystem
 
+    level_0 = data_store.data_coordinate_systems[0]
     world = WorldCoordinateSystem(
         name="world",
         axes=tuple(
-            Axis(name=name, axis_type=axis_type, unit=unit)
-            for name, axis_type, unit in zip(
-                data_store.axis_names,
-                data_store.axis_types,
-                data_store.axis_units,
-                strict=True,
-            )
+            Axis(name=ax.name, axis_type=ax.axis_type, unit=ax.unit)
+            for ax in level_0.axes
         ),
     )
-    level_0 = data_store.data_coordinate_systems[0]
     voxel_to_world = AffineTransform.from_axis_map(
         level_0,
         world,
@@ -256,6 +337,7 @@ def _print_metadata_table(
     level_0_scale_spatial: np.ndarray,
     world_extents_spatial: np.ndarray,
     depth_range: tuple[float, float],
+    translations: _TranslationSource = "none",
 ) -> None:
     """Print the startup metadata summary as a Rich table."""
     from rich.console import Console
@@ -271,8 +353,9 @@ def _print_metadata_table(
     table.add_column("Field", style="bold cyan", no_wrap=True)
     table.add_column("Value")
     table.add_row("dtype", str(data_store.dtype))
-    table.add_row("axes", "  ".join(data_store.axis_names))
-    table.add_row("units", "  ".join(str(u) for u in data_store.axis_units))
+    data_axes = data_store.data_coordinate_systems[0].axes
+    table.add_row("axes", "  ".join(ax.name for ax in data_axes))
+    table.add_row("units", "  ".join(str(ax.unit) for ax in data_axes))
     table.add_row("levels", str(data_store.n_levels))
     for i, shape in enumerate(data_store.level_shapes):
         table.add_row(f"  level {i}", str(list(shape)))
@@ -285,4 +368,12 @@ def _print_metadata_table(
         "  ".join(f"{v:.4g}" for v in world_extents_spatial),
     )
     table.add_row("depth range", f"near={depth_range[0]:.2f}  far={depth_range[1]:.0f}")
+    table.add_row(
+        "level translations",
+        {
+            "declared": "declared in the file",
+            "inferred": "inferred: (factor - 1) / 2 level-0 voxels (centre-aligned)",
+            "none": "none",
+        }[translations],
+    )
     Console().print(table)
