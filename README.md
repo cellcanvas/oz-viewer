@@ -33,6 +33,12 @@ You can load a v0.4 or v0.5 OME-Zarr file into a single-canvas 2d/3d viewer usin
 oz-viewer view path/to/image.ome.zarr
 ```
 
+Note that some OME-Zarr files do not provide the necessary translation in the multiscale transforms to keep the downscaled voxels centered. `oz-viewer` provides a flag to infer the translations based on the shapes and downscale factors of the multiscale levels. Use the `--infer-multiscale-translations` flag to enable this behavior.
+
+```sh
+oz-viewer view path/to/image.ome.zarr --infer-multiscale-translations`
+```
+
 Example viewing a https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_ASLM_on.zarr (1937, 2048, 2048), anisotropic voxels (file was on local SSD).
 
 https://github.com/user-attachments/assets/59c31e89-db42-4cec-ae4f-373d997c227f
@@ -45,11 +51,18 @@ You can load a v0.4 or v0.5 OME-Zarr file into an orthoviewer using the `oz-view
 oz-viewer ortho path/to/image.ome.zarr
 ```
 
+Note that some OME-Zarr files do not provide the necessary translation in the multiscale transforms to keep the downscaled voxels centered. `oz-viewer` provides a flag to infer the translations based on the shapes and downscale factors of the multiscale levels. Use the `--infer-multiscale-translations` flag to enable this behavior.
+
+```sh
+oz-viewer ortho path/to/image.ome.zarr --infer-multiscale-translations`
+```
+
+
 Example viewing https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_ASLM_on.zarr (1937, 2048, 2048), anisotropic voxels (file was on local SSD).
 
 https://github.com/user-attachments/assets/a6c0cab9-0cd9-4fe0-80c2-c77207b4fd77
 
-You can click the multichannel button in the upper left-hand corner to toggle between single/multichannel rendering. Example viewing the scikit-image cells3d (converted to ome-zarr) multichannel image
+Images with a channel axis open as a composite of their channels (up to 4). Use the "Composite channels" checkbox in the image controls on the left to switch between the composite and single-channel rendering, where a slider steps through the channels. Example viewing the scikit-image cells3d (converted to ome-zarr) multichannel image
 
 https://github.com/user-attachments/assets/b6655863-b8fb-4eea-be84-eb031283494e
 

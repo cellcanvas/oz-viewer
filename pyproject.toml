@@ -19,7 +19,7 @@ name = "oz-viewer"
 dynamic = ["version"]
 description = "A viewer for ome-zarr images."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "BSD-3-Clause" }
 authors = [{ name = "Kevin Yamauchi", email = "kevin.yamauchi@gmail.com" }]
 # https://pypi.org/classifiers/
@@ -27,7 +27,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
@@ -38,7 +37,7 @@ dependencies = [
     "typer >= 0.12",
     "rich >= 13",
     "numpy >= 1.24",
-    "cellier[pyside,anywidget]>=0.0.26",
+    "cellier[pyside,anywidget]>=0.0.27",
     "aiohttp >= 3.9",
     "zarr >= 3.0",
     "s3fs",
@@ -49,15 +48,6 @@ dependencies = [
 # https://peps.python.org/pep-0621/#dependencies-optional-dependencies
 # add dependencies for "extra" features here.  Not dev dependencies.
 [project.optional-dependencies]
-# Dependencies for the notebook examples under examples/.  Install with
-# `pip install -e '.[examples]'`.  cellier[anywidget] adds the anywidget
-# front-end (notebook rendering); scikit-image + pooch provide the cells3d
-# sample dataset used by examples/viewer.ipynb.
-#
-# NOTE: the anywidget canvas backend currently requires rendercanvas from git
-# main, which cannot be expressed as a version pin here -- install it
-# separately:
-#   uv pip install "rendercanvas @ git+https://github.com/pygfx/rendercanvas.git"
 examples = [
     "jupyterlab>=4.5.6",
     "scikit-image>=0.24",

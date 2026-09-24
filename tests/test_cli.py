@@ -7,6 +7,7 @@ import sys
 import types
 from typing import TYPE_CHECKING
 
+import pytest
 from typer.testing import CliRunner
 
 if TYPE_CHECKING:
@@ -133,7 +134,7 @@ def test_ortho_perf_startup_flag_enables_tracer(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None, **_):
         captured["zarr_uri"] = zarr_uri
         captured["theme"] = theme
         captured["perf"] = perf
@@ -159,7 +160,7 @@ def test_ortho_perf_table_flag_sets_tracer_show_table(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None, **_):
         captured["perf"] = perf
 
     monkeypatch.setitem(
@@ -183,7 +184,7 @@ def test_ortho_perf_table_title_sets_tracer_title(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None, **_):
         captured["perf"] = perf
 
     monkeypatch.setitem(
@@ -214,7 +215,7 @@ def test_ortho_perf_env_enables_tracer(tmp_path, monkeypatch):
 
     captured: dict[str, object] = {}
 
-    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None):
+    def _fake_launch(zarr_uri, theme="dark", perf=None, channel_axis=None, **_):
         captured["perf"] = perf
 
     monkeypatch.setitem(
@@ -282,3 +283,37 @@ def test_startup_perf_tracer_rich_table_uses_default_title(capsys):
 
     stderr = capsys.readouterr().err
     assert "Tracer Default Title" in stderr
+
+
+# ---------------------------------------------------------------------------
+# --infer-multiscale-translations
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "launcher"),
+    [("view", "launch_viewer"), ("ortho", "launch_orthoviewer")],
+)
+@pytest.mark.parametrize("flag", [True, False])
+def test_infer_multiscale_translations_flag_reaches_launcher(
+    tmp_path, monkeypatch, command, launcher, flag
+):
+    zarr_path = tmp_path / "demo.zarr"
+    zarr_path.mkdir()
+    captured: dict[str, object] = {}
+
+    def _fake_launch(zarr_uri, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "oz_viewer.viewer",
+        types.SimpleNamespace(**{launcher: _fake_launch}),
+    )
+
+    args = [command, str(zarr_path)]
+    if flag:
+        args.append("--infer-multiscale-translations")
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert captured["infer_multiscale_translations"] is flag
