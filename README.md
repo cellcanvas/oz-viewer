@@ -33,6 +33,12 @@ You can load a v0.4 or v0.5 OME-Zarr file into a single-canvas 2d/3d viewer usin
 oz-viewer view path/to/image.ome.zarr
 ```
 
+Note that some OME-Zarr files do not provide the necessary translation in the multiscale transforms to keep the downscaled voxels centered. `oz-viewer` provides a flag to infer the translations based on the shapes and downscale factors of the multiscale levels. Use the `--infer-multiscale-translations` flag to enable this behavior.
+
+```sh
+oz-viewer view path/to/image.ome.zarr --infer-multiscale-translations`
+```
+
 Example viewing a https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_ASLM_on.zarr (1937, 2048, 2048), anisotropic voxels (file was on local SSD).
 
 https://github.com/user-attachments/assets/59c31e89-db42-4cec-ae4f-373d997c227f
@@ -44,6 +50,13 @@ You can load a v0.4 or v0.5 OME-Zarr file into an orthoviewer using the `oz-view
 ```sh
 oz-viewer ortho path/to/image.ome.zarr
 ```
+
+Note that some OME-Zarr files do not provide the necessary translation in the multiscale transforms to keep the downscaled voxels centered. `oz-viewer` provides a flag to infer the translations based on the shapes and downscale factors of the multiscale levels. Use the `--infer-multiscale-translations` flag to enable this behavior.
+
+```sh
+oz-viewer ortho path/to/image.ome.zarr --infer-multiscale-translations`
+```
+
 
 Example viewing https://livingobjects.ebi.ac.uk/idr/zarr/v0.5/idr0066/ExpA_VIP_ASLM_on.zarr (1937, 2048, 2048), anisotropic voxels (file was on local SSD).
 
