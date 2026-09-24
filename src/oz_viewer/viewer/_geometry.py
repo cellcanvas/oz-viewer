@@ -49,6 +49,8 @@ class _ViewerGeometry(NamedTuple):
     world_max_spatial: np.ndarray
     initial_clim_max: float
     clim_range: tuple[float, float]
+    #: Decimal places for values in data units -- the contrast limits and the
+    #: iso threshold: 0 for integer data, 2 for float.
     slider_decimals: int
     #: ``(near, far)`` clip distances derived from the world extents.
     depth_range: tuple[float, float]
@@ -78,7 +80,8 @@ class _ViewerGeometry(NamedTuple):
         is in single mode; a composite draws every channel at once.  Every
         other axis (spatial, time) is
         continuous over ``[0, world_max]``, from the first voxel centre to the
-        last.  Derived from the metadata rather than via
+        last, and shows just enough decimals to resolve half a voxel (see
+        :func:`_axis_decimals`).  Derived from the metadata rather than via
         ``cellier.convenience.axis_values_from_viewer``, which widens each axis
         by half a voxel at both ends.
         """
@@ -94,7 +97,9 @@ class _ViewerGeometry(NamedTuple):
                 )
             else:
                 values[axis] = ContinuousAxisValues(
-                    min=0.0, max=float(self.world_max_full[axis])
+                    min=0.0,
+                    max=float(self.world_max_full[axis]),
+                    decimals=_axis_decimals(float(self.level_0_scale[axis])),
                 )
         return values
 
@@ -109,6 +114,28 @@ class _ViewerGeometry(NamedTuple):
             axis: float(self.world_max_full[axis]) / 2.0
             for axis in self.spatial_indices
         }
+
+
+#: The most decimals a dims slider readout is given, whatever the voxel size.
+_MAX_AXIS_DECIMALS = 6
+
+
+def _axis_decimals(scale: float) -> int:
+    """The fewest decimals that resolve half a voxel of *scale* world units.
+
+    The smallest ``d >= 0`` with ``10**-d <= scale / 2``: a 5 um voxel reads
+    in whole micrometres, a 0.26 um voxel to one decimal.  A scale that is not
+    a positive finite number gets 2, the dims slider's usual precision.
+    """
+    if not np.isfinite(scale) or scale <= 0.0:
+        return 2
+    half = scale / 2.0
+    decimals = 0
+    # A small tolerance so an exact power of ten (a 0.2 voxel) is not pushed
+    # one decimal further by floating-point error.
+    while 10.0**-decimals > half * (1.0 + 1e-9) and decimals < _MAX_AXIS_DECIMALS:
+        decimals += 1
+    return decimals
 
 
 def extract_viewer_geometry(

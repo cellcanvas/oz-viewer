@@ -116,6 +116,7 @@ def image_visual_kwargs(
             appearance=_IMAGE_FIELDS,
             colormap_names=_DEFAULT_COLORMAPS,
             clim_range=geometry.clim_range,
+            decimals=geometry.slider_decimals,
             channel_labels=dict(enumerate(labels)) if labels is not None else None,
         ),
     }

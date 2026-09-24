@@ -45,6 +45,17 @@ def _dock_control_names(window, title: str) -> set[str]:
     return {n for n in names if n}
 
 
+def _dock_selector_items(window, title: str) -> list[list[str]]:
+    """The items of every combo box inside the dock called *title*."""
+    from PySide6.QtWidgets import QComboBox, QDockWidget
+
+    dock = next(d for d in window.findChildren(QDockWidget) if d.windowTitle() == title)
+    return [
+        [combo.itemText(i) for i in range(combo.count())]
+        for combo in dock.findChildren(QComboBox)
+    ]
+
+
 def test_single_channel_ortho_build(qapp, tmp_path):
     """Blobs (z,y,x) -> single-mode ortho: 4 panels, overlays, both docks."""
     from oz_viewer.data._blobs import make_example_zarr
@@ -58,7 +69,7 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         assert set(build.viewer.scenes) == {"xy", "xz", "yz", "vol"}
         assert not any(v.composite for v in build.visuals.values())
 
-        # One linked appearance; only the vol panel's LOD policy differs.
+        # One starting appearance; only the vol panel's LOD policy differs.
         assert build.visuals["vol"].appearance.force_level is not None
         assert build.visuals["vol"].appearance.frustum_cull is False
         assert build.visuals["xy"].appearance.force_level is None
@@ -85,6 +96,18 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         assert "Overlays" in titles
         names = _dock_control_names(handle.window, "Left")
         assert {"Contrast", "Colormap", "Render mode", "LOD bias"} <= names
+        assert "Data fetch status" in names
+
+        # One control for the three 2D views and one for the 3D view, chosen
+        # with the dock's selector.
+        from cellier.convenience.layout._shared import appearance_targets
+
+        assert ["image (2D views)", "image (3D view)"] in _dock_selector_items(
+            handle.window, "Left"
+        )
+        views_2d, view_3d = appearance_targets(build.viewer)
+        assert views_2d.visual_ids == [build.visuals[k].id for k in ("xy", "xz", "yz")]
+        assert view_3d.visual_ids == [build.vol_visual_id]
     finally:
         handle.close()
 
@@ -128,8 +151,8 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
         )
         assert all(isinstance(axis_values[a], ContinuousAxisValues) for a in (1, 2, 3))
 
-        # The image control on the left drives all four panels; the overlay
-        # panel on the right.
+        # The image controls on the left (the 2D views' control is shown
+        # first); the overlay panel on the right.
         titles = _dock_titles(handle.window)
         assert "Left" in titles
         assert "Overlays" in titles
@@ -161,5 +184,86 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
         assert vol.appearance.transparency_mode is None
         viewer.set_image_composite(build.visuals, False)
         assert vol.single.opacity == pytest.approx(0.6)
+    finally:
+        handle.close()
+
+
+def test_the_2d_and_3d_views_are_edited_separately(qapp, tmp_path):
+    """A contrast edit in the dock's 2D views control leaves the volume alone."""
+    from PySide6.QtWidgets import QDockWidget
+    from superqt import QLabeledDoubleRangeSlider
+
+    from oz_viewer.data._blobs import make_example_zarr
+    from oz_viewer.viewer._orthoviewer import _build_and_show_ortho_qt
+
+    zarr_path = make_example_zarr(output_path=tmp_path / "blobs.ome.zarr")
+    handle = _build_and_show_ortho_qt(f"file://{zarr_path}")
+    try:
+        build = handle.build
+        vol_clim = tuple(build.visuals["vol"].single.clim)
+        dock = next(
+            d
+            for d in handle.window.findChildren(QDockWidget)
+            if d.windowTitle() == "Left"
+        )
+        # The selector starts on the 2D views; the 3D view's control is built
+        # but not shown.
+        (contrast,) = [
+            s
+            for s in dock.findChildren(QLabeledDoubleRangeSlider)
+            if s.isVisibleTo(dock)
+        ]
+
+        contrast.setValue((10.0, 20.0))
+
+        for key in ("xy", "xz", "yz"):
+            assert tuple(build.visuals[key].single.clim) == pytest.approx((10.0, 20.0))
+        assert tuple(build.visuals["vol"].single.clim) == vol_clim
+    finally:
+        handle.close()
+
+
+def test_the_slice_overlays_start_at_0_8_and_keep_the_slider_value(qapp, tmp_path):
+    """The overlay opacity holds across render-mode switches.
+
+    The transparency manager used to write a fixed opacity per render mode
+    onto the slice plane and orientation meshes, overriding the slider.
+    """
+    from PySide6.QtWidgets import QDockWidget
+    from superqt import QLabeledDoubleSlider
+
+    from oz_viewer.data._blobs import make_example_zarr
+    from oz_viewer.viewer._orthoviewer import _build_and_show_ortho_qt
+
+    zarr_path = make_example_zarr(output_path=tmp_path / "blobs.ome.zarr")
+    handle = _build_and_show_ortho_qt(f"file://{zarr_path}")
+    try:
+        build = handle.build
+        controller = build.viewer.controller
+        overlays = build.overlays
+        mesh_ids = [overlays.plane_visual.id, *overlays.axis_visual_ids]
+
+        def opacities():
+            return [controller.get_visual_model(v).appearance.opacity for v in mesh_ids]
+
+        assert opacities() == pytest.approx([0.8] * 4)
+        assert overlays.plane_store.colors[:, 3] == pytest.approx([0.8] * 6)
+        dock = next(
+            d
+            for d in handle.window.findChildren(QDockWidget)
+            if d.windowTitle() == "Overlays"
+        )
+        (slider,) = dock.findChildren(QLabeledDoubleSlider)
+        assert slider.value() == pytest.approx(0.8)
+
+        # Switching render mode keeps it (MIP caps the plane at 0.99).
+        vol = build.vol_visual_id
+        controller.update_single_appearance_field(vol, "render_mode", "mip")
+        assert overlays.transparency_manager.current_mode == "mip"
+        assert opacities() == pytest.approx([0.8] * 4)
+
+        slider.setValue(0.5)
+        controller.update_single_appearance_field(vol, "render_mode", "iso")
+        assert opacities() == pytest.approx([0.5] * 4)
     finally:
         handle.close()

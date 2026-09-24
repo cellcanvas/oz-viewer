@@ -1,7 +1,8 @@
 """Qt-only overlay control panel for the orthoviewer.
 
 The image itself is controlled by cellier's cross-toolkit
-``AppearanceControls`` dock, which drives all four panels' visuals together.
+``AppearanceControls`` dock (one control for the 2D views, one for the 3D
+view).
 The orthoviewer's 3D overlays (the slice planes and the orientation gizmo) are
 plain meshes oz-viewer adds to the ``vol`` scene only, and the convenience
 docks have no public way to configure controls for them, so their panel is
@@ -46,14 +47,14 @@ def _plane_opacity_group(controller, overlays: OrthoOverlays, initial_opacity: f
 
     plane_visual = overlays.plane_visual
     plane_store = overlays.plane_store
-    axis_visual_ids = overlays.axis_visual_ids
+    manager = overlays.transparency_manager
 
     def _on_changed(value: float) -> None:
-        controller.update_appearance_field(plane_visual.id, "opacity", value)
+        # The manager owns the meshes' opacity so it survives render-mode
+        # switches; the plane's face colours carry it too.
+        manager.overlay_opacity = value
         plane_store.colors = _make_plane_colors(value)
         controller.reslice_visual(plane_visual.id)
-        for vid in axis_visual_ids:
-            controller.update_appearance_field(vid, "opacity", value)
 
     slider.valueChanged.connect(_on_changed)
     layout.addWidget(slider)

@@ -34,7 +34,9 @@ _AXIS_3D_PRISM_CROSS_SECTION_FRACTION: float = 0.020
 _AXIS_3D_CUBE_COLOUR: tuple[float, float, float, float] = (0.75, 0.75, 0.75, 1.0)
 _N_FACES_PER_BOX: int = 12
 
-_INITIAL_PLANE_OPACITY: float = 1.0
+# The "Slice overlay opacity" the orthoviewer starts with: the slice plane and
+# the orientation-axis meshes, which the overlay panel's slider drives together.
+_INITIAL_PLANE_OPACITY: float = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -54,11 +56,17 @@ _MIP_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 1.0)
 
 @dataclass
 class _VisualRenderProfile:
+    """How an overlay mesh blends in one render mode.
+
+    The mesh's opacity is the overlay opacity (the "Slice overlay opacity"
+    slider); a profile only caps it at ``max_opacity``.
+    """
+
     render_order: int
     depth_test: bool
     depth_write: bool
     transparency_mode: str
-    opacity: float
+    max_opacity: float = 1.0
 
 
 _ISO_PLANE_PROFILE = _VisualRenderProfile(
@@ -66,28 +74,26 @@ _ISO_PLANE_PROFILE = _VisualRenderProfile(
     depth_test=True,
     depth_write=True,
     transparency_mode="blend",
-    opacity=1.0,
 )
 _MIP_PLANE_PROFILE = _VisualRenderProfile(
     render_order=1,
     depth_test=False,
     depth_write=True,
     transparency_mode="weighted_blend",
-    opacity=0.99,
+    # Kept just below opaque, as this profile always set it.
+    max_opacity=0.99,
 )
 _ISO_AXES_PROFILE = _VisualRenderProfile(
     render_order=1,
     depth_test=True,
     depth_write=True,
     transparency_mode="blend",
-    opacity=1.0,
 )
 _MIP_AXES_PROFILE = _VisualRenderProfile(
     render_order=2,
     depth_test=False,
     depth_write=False,
     transparency_mode="blend",
-    opacity=1.0,
 )
 
 
@@ -111,10 +117,14 @@ class _VolTransparencyManager:
     changes, whatever the origin (Qt, anywidget, programmatic).
 
     In single mode the volume's opacity and blending follow a per-render-mode
-    profile, and edits made through the image control are remembered in the
-    current profile.  A composite hands blending back to cellier (its default
+    profile, and edits made through the 3D view's image control are
+    remembered in the current profile (the 2D views' control does not write
+    the ``vol`` image).  A composite hands blending back to cellier (its default
     follows the mode) and keeps the channels' own opacities; only the meshes
     follow the render mode there.
+
+    The meshes' opacity is :attr:`overlay_opacity`, kept across render-mode
+    switches; each mode's profile only caps it.
 
     Subscribes through ``controller.connect_widget`` (the widget contract:
     ``_id``, ``changed``, ``closed``), so the bus rewires it if the image's
@@ -135,8 +145,10 @@ class _VolTransparencyManager:
         *,
         plane_visual_id=None,
         axis_visual_ids: list | None = None,
+        overlay_opacity: float = _INITIAL_PLANE_OPACITY,
     ) -> None:
         self._id = uuid4()
+        self._overlay_opacity = float(overlay_opacity)
         self._controller = controller
         self._vol_visual_id = vol_visual_id
         self._plane_visual_id = plane_visual_id
@@ -165,6 +177,20 @@ class _VolTransparencyManager:
     @property
     def current_mode(self) -> str:
         return self._current_mode
+
+    @property
+    def overlay_opacity(self) -> float:
+        """The slice plane's and orientation meshes' opacity.
+
+        Setting it re-applies the meshes' profiles, so it holds across
+        render-mode switches.
+        """
+        return self._overlay_opacity
+
+    @overlay_opacity.setter
+    def overlay_opacity(self, value: float) -> None:
+        self._overlay_opacity = float(value)
+        self._apply_mesh_profiles()
 
     @property
     def current_profile(self) -> _VolTransparencyProfile:
@@ -247,7 +273,9 @@ class _VolTransparencyManager:
         c.update_appearance_field(
             visual_id, "transparency_mode", profile.transparency_mode
         )
-        c.update_appearance_field(visual_id, "opacity", profile.opacity)
+        c.update_appearance_field(
+            visual_id, "opacity", min(self._overlay_opacity, profile.max_opacity)
+        )
 
     def _apply_vol_profile(self) -> None:
         """Apply the current volume profile, or hand blending back in composite.
@@ -277,6 +305,9 @@ class _VolTransparencyManager:
 
     def apply(self) -> None:
         self._apply_vol_profile()
+        self._apply_mesh_profiles()
+
+    def _apply_mesh_profiles(self) -> None:
         plane_profile = self._plane_profiles[self._current_mode]
         self._apply_profile_to_mesh(self._plane_visual_id, plane_profile)
         axes_profile = self._axes_profiles[self._current_mode]
@@ -527,7 +558,7 @@ def _make_axis_meshes(
         appearance = MeshFlatAppearance(
             color_mode="face",
             side="both",
-            opacity=1.0,
+            opacity=_INITIAL_PLANE_OPACITY,
             render_order=1,
             depth_test=True,
             depth_write=True,

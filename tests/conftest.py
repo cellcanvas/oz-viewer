@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import gc
 import sys
 import threading
 import time
@@ -24,9 +25,11 @@ def _close_cellier_controllers(monkeypatch):
     A controller owns render canvases and GPU resources that the GUI backend
     holds, not Python refcounting.  A test that only closes its window leaves
     them to the garbage collector, which may run their teardown at any later
-    moment on any thread -- including inside zarr's I/O thread while a later
-    test writes an example store, which then deadlocks.  Mirrors cellier's own
-    test teardown.
+    moment -- including while a later test writes an example store with
+    zarr's I/O threads (and, through ome-zarr-py, a dask thread pool) busy,
+    which has deadlocked and segfaulted.  Mirrors cellier's own test
+    teardown, and then collects here so that nothing the test left behind is
+    finalized at such a moment.
     """
     from cellier.controller import CellierController
 
@@ -53,28 +56,90 @@ def _close_cellier_controllers(monkeypatch):
 
     # Qt deletes a closed widget only when the event loop next runs.
     widgets_module = sys.modules.get("PySide6.QtWidgets")
+    app = None
     if widgets_module is not None:
         app = widgets_module.QApplication.instance()
         if app is not None:
             app.processEvents()
+
+    # Finalize the test's leftovers here, at a quiet point, rather than
+    # whenever the collector next runs -- which can be while the next test
+    # writes its example store with zarr's I/O threads busy.
+    gc.collect()
+    if app is not None:
+        app.processEvents()
+
+
+def _write_demo_image(path: Path) -> None:
+    """Write a small demo OME-Zarr 0.5 image with plain zarr.
+
+    ``c, z, y, x`` = ``(1, 1, 64, 64)`` uint16 random data, two levels with
+    y and x halved, chunks ``(1, 1, 32, 32)`` -- the layout yaozarrs' demo
+    writer produces.  Written directly rather than through that writer, which
+    builds the pyramid with ome-zarr-py and so runs a dask thread pool inside
+    the test process (see ``_close_cellier_controllers``).
+    """
+    import numpy as np
+    import zarr
+
+    rng = np.random.default_rng(42)
+    level_0 = rng.integers(0, 1000, size=(1, 1, 64, 64), dtype=np.uint16)
+    root = zarr.open_group(str(path), mode="w", zarr_format=3)
+    datasets = []
+    for level in range(2):
+        factor = 2**level
+        data = level_0[..., ::factor, ::factor]
+        array = root.create_array(
+            f"s{level}",
+            shape=data.shape,
+            chunks=(1, 1, 32, 32),
+            dtype=data.dtype,
+            dimension_names=("c", "z", "y", "x"),
+        )
+        array[:] = data
+        datasets.append(
+            {
+                "path": f"s{level}",
+                "coordinateTransformations": [
+                    {"type": "scale", "scale": [1.0, 1.0, factor, factor]}
+                ],
+            }
+        )
+    root.attrs["ome"] = {
+        "version": "0.5",
+        "multiscales": [
+            {
+                "name": "demo",
+                "axes": [
+                    {"name": "c", "type": "channel"},
+                    {"name": "z", "type": "space"},
+                    {"name": "y", "type": "space"},
+                    {"name": "x", "type": "space"},
+                ],
+                "datasets": datasets,
+            }
+        ],
+    }
 
 
 @pytest.fixture
 def write_demo_ome(tmp_path: Path) -> Callable[[Literal["image", "plate"]], Path]:
     """Return a factory that writes demo OME-Zarr stores to tmp_path.
 
-    Skips the test if zarr or ome-zarr are not installed.
+    The image is written with plain zarr (:func:`_write_demo_image`).  The
+    plate still comes from yaozarrs' demo writer (ome-zarr-py, and so dask);
+    the test is skipped if that is not installed.
     """
-    try:
-        from yaozarrs._demo_data import write_ome_image, write_ome_plate
-    except ImportError:
-        pytest.skip("zarr and ome-zarr are required for demo data fixtures")
 
     def _factory(store_type: Literal["image", "plate"] = "image") -> Path:
         if store_type == "image":
             path = tmp_path / "demo_image.zarr"
-            write_ome_image(path)
+            _write_demo_image(path)
         elif store_type == "plate":
+            try:
+                from yaozarrs._demo_data import write_ome_plate
+            except ImportError:
+                pytest.skip("ome-zarr is required for the demo plate fixture")
             path = tmp_path / "demo_plate.zarr"
             write_ome_plate(path)
         else:

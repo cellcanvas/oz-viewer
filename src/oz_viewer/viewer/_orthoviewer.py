@@ -3,11 +3,12 @@
 Rebuilt on :class:`cellier.convenience.OrthoViewer`, so the same builder runs
 under both ``gui="qt"`` (desktop / CLI) and ``gui="anywidget"`` (Jupyter /
 marimo).  The four pre-wired panels, cross-panel axis sync, the image fanned
-out to every panel, and the image control (``AppearanceControls``, driving all
-four panels together, with the single/composite switch) come from the
-convenience API; the OME-Zarr-specific geometry (see
-:mod:`oz_viewer.viewer._geometry`) and the 3D overlays (see
-:mod:`oz_viewer.viewer._ortho_overlays`) are re-attached on top.
+out to every panel, and the image controls (``AppearanceControls``: a
+selector between one control for the three 2D views and one for the 3D view,
+each with its own single/composite switch) come from the convenience API;
+the OME-Zarr-specific geometry (see :mod:`oz_viewer.viewer._geometry`) and
+the 3D overlays (see :mod:`oz_viewer.viewer._ortho_overlays`) are
+re-attached on top.
 
 The overlay controls (orientation gizmo toggle, slice-plane opacity) have no
 convenience equivalent, so they are a Qt-only dock (see
@@ -68,8 +69,9 @@ def build_ortho_viewer(
     """Build a :class:`cellier.convenience.OrthoViewer` for an OME-Zarr store.
 
     Fans one multiscale image out to every panel.  When *geometry* found a
-    channel axis the image starts in composite mode; the image control
-    switches every panel to single mode (and back) at runtime.
+    channel axis the image starts in composite mode; the image controls
+    switch the 2D views and the 3D view to single mode (and back) at runtime,
+    each on its own.
 
     Parameters
     ----------
@@ -115,11 +117,12 @@ def _add_image_visuals(
 ) -> _OrthoBuild:
     """Fan one multiscale image out to every panel.
 
-    The image control drives the four panels as one group, so they share an
-    appearance.  Only the ``vol`` panel's level-of-detail policy differs: it
-    is pinned to the coarsest level and not frustum-culled.  Those shared
-    appearance fields are not in the control, so the group never overwrites
-    them.
+    They start with one appearance.  cellier then gives the three 2D panels
+    one image control and the ``vol`` panel another, so the 2D views and the
+    3D view can differ from there on.  The ``vol`` panel's level-of-detail
+    policy differs from the start: it is pinned to the coarsest level and not
+    frustum-culled.  Those appearance fields are not in the control, so it
+    never overwrites them.
     """
     controller = viewer.controller
     visuals = viewer.add_image_multiscale(
@@ -198,7 +201,8 @@ def build_ortho_layout(
     # Screen-space 2D orientation axes on each slice panel (both toolkits).
     _add_2d_axis_overlays(viewer)
 
-    # The image control drives all four panels' sibling visuals together.
+    # The image controls: a selector between the 2D views (xy, xz, yz driven
+    # together) and the 3D view.
     layout = Layout(center=grid, left_dock=AppearanceControls())
     return layout, grid
 
@@ -418,7 +422,7 @@ def _build_and_show_ortho_qt(
 def _attach_qt_controls(build: _OrthoBuild, window) -> object | None:
     """Bolt oz's Qt-only overlay panel onto the rendered ``QMainWindow``.
 
-    The image control is already in the layout's left ``AppearanceControls``
+    The image controls are already in the layout's left ``AppearanceControls``
     dock; this adds the overlay toggles on the right.
     """
     from PySide6 import QtWidgets
