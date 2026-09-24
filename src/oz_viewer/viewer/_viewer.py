@@ -2,6 +2,7 @@
 
 Rebuilt on top of :mod:`cellier.convenience`, so the same builder runs under
 both ``gui="qt"`` (desktop / CLI) and ``gui="anywidget"`` (Jupyter / marimo).
+
 The image control (both single and composite modes, and the switch between
 them) comes from cellier's cross-toolkit ``AppearanceControls`` dock and the
 2D/3D toggle from the dims control embedded in the canvas view; this module
@@ -130,6 +131,7 @@ def build_viewer_layout(
     # between them.  The 2D/3D toggle needs no dock of its own -- cellier
     # embeds it in the canvas view's dims control.
     layout = Layout(center=canvas_view, left_dock=AppearanceControls())
+
     return layout, canvas_view
 
 
