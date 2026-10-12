@@ -74,7 +74,7 @@ https://github.com/user-attachments/assets/f572a57e-ab92-4bf4-8b4c-e6af46c9f6ed
 
 ## Test dataset latency
 
-The latency for fetching chunks greatly impacts the rendering performance of the viewer. High latency means that fetching chunks from the data store is slow and thus rendering feels slow. If the latency for fetching data from your image is high, you can offset it by increasing the lod_bias which causes the renderer to prefer loading lower resolution chunks. This reduces the aount of data that needs to be loaded, but sacrifices detail.
+The latency for fetching chunks greatly impacts the rendering performance of the viewer. High latency means that fetching chunks from the data store is slow and thus rendering feels slow. If the latency for fetching data from your image is high, you can offset it by increasing the level-of-detail bias (the "Settled bias" slider under "Level of detail") which causes the renderer to prefer loading lower resolution chunks. This reduces the aount of data that needs to be loaded, but sacrifices detail.
 
 To measure the latency, you can use the `oz-viewer ping` CLI. See the example below. Replace the path with the path to your data. You can use both URL and file paths.
 

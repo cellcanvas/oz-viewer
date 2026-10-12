@@ -60,14 +60,15 @@ def test_single_channel_viewer_build(qapp, tmp_path):
         # so the appearance panel is the only dock.
         assert _dock_titles(handle.window) == ["Left"]
 
-        # The image fields resolved to controls, plus the bounding box cellier
-        # adds to any configured appearance panel.
+        # The image fields resolved to controls, plus the level-of-detail and
+        # bounding box controls listed beside the image control.
         names = _dock_control_names(handle.window, "Left")
         assert {
             "Contrast",
             "Colormap",
             "Render mode",
-            "LOD bias",
+            "Level of detail",
+            "Settled bias",
             "Bounding box",
         } <= names
     finally:
@@ -129,17 +130,13 @@ def test_composite_holds_at_most_cellier_default_channels(tmp_path, write_demo_o
 
 
 @pytest.mark.parametrize("fixture_name", ["blobs", "demo"])
-def test_controls_configs_are_config_objects(
-    qapp, tmp_path, write_demo_ome, fixture_name
-):
-    """``controls=`` must be a config dataclass, never a plain dict.
+def test_controls_are_control_models(qapp, tmp_path, write_demo_ome, fixture_name):
+    """``controls=`` is a list of cellier control models.
 
-    cellier stores whatever ``add_*`` was handed and dispatches on its type, so
-    a dict is accepted, recorded, and then silently ignored at render time --
-    no dock, no error, no warning.  This is the cheap, Qt-window-free guard for
-    that: it fails on the config object, not on a missing widget.
+    The cheap, Qt-window-free guard on what the viewer records for its dock:
+    it fails on the control list, not on a missing widget.
     """
-    from cellier.convenience import BaseControlsConfig
+    from cellier.convenience import Control
 
     from oz_viewer.viewer._geometry import extract_viewer_geometry
     from oz_viewer.viewer._viewer import build_viewer
@@ -156,6 +153,13 @@ def test_controls_configs_are_config_objects(
 
     configs = list(viewer._controls_configs.values())
     assert configs, "no controls were configured for the visual"
-    assert all(isinstance(c, BaseControlsConfig) for c in configs)
-    # One image control config covers single and composite modes alike.
-    assert [type(c).__name__ for c in configs] == ["MultiscaleImageControlsConfig"]
+    # One visual, so one list; its image control covers single and composite
+    # modes alike.
+    (controls,) = configs
+    assert all(isinstance(c, Control) for c in controls)
+    assert [type(c).__name__ for c in controls] == [
+        "ImageControl",
+        "LevelOfDetailControl",
+        "BoundingBoxControl",
+        "LoadingIndicator",
+    ]

@@ -33,7 +33,7 @@ def test_axis_decimals_resolve_half_a_voxel(scale, expected):
 
 def test_an_integer_image_gets_integer_contrast_and_axis_readouts(tmp_path):
     """The uint8 blobs example: 0 decimals for the controls and every axis."""
-    from cellier.convenience import ContinuousAxisValues
+    from cellier.convenience import ContinuousAxisValues, ImageControl
 
     from oz_viewer.data._blobs import make_example_zarr
     from oz_viewer.viewer._geometry import extract_viewer_geometry
@@ -45,7 +45,8 @@ def test_an_integer_image_gets_integer_contrast_and_axis_readouts(tmp_path):
     controls = image_visual_kwargs(geometry, render_mode="mip", lod_bias=1.0)[
         "controls"
     ]
-    assert controls.decimals == 0
+    (image_control,) = [c for c in controls if isinstance(c, ImageControl)]
+    assert image_control.decimals == 0
 
     axis_values = geometry.axis_values
     assert all(isinstance(v, ContinuousAxisValues) for v in axis_values.values())

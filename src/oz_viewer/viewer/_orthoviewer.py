@@ -7,11 +7,15 @@ out to every panel, and the image controls (``AppearanceControls``: a
 selector between one control for the three 2D views and one for the 3D view,
 each with its own single/composite switch) come from the convenience API;
 the OME-Zarr-specific geometry (see :mod:`oz_viewer.viewer._geometry`) and
-the 3D overlays (see :mod:`oz_viewer.viewer._ortho_overlays`) are
+the orientation gizmo (see :mod:`oz_viewer.viewer._ortho_overlays`) are
 re-attached on top.
 
-The overlay controls (orientation gizmo toggle, slice-plane opacity) have no
-convenience equivalent, so they are a Qt-only dock (see
+The 3D view draws the three 2D views' slices on their planes: cellier's
+``"plane"`` render mode, with the planes tied to the 2D sliders by
+``OrthoViewer.plane_controller``.
+
+The orientation gizmo's toggle has no convenience equivalent, so it is a
+Qt-only dock (see
 :mod:`oz_viewer.viewer._ortho_controls`) that is omitted in the anywidget path.
 """
 
@@ -107,6 +111,7 @@ def build_ortho_viewer(
 
     build = _add_image_visuals(viewer, data_store, geometry)
     _center_ortho_slices(viewer, geometry)
+    _link_slice_planes(viewer)
     return build
 
 
@@ -119,23 +124,24 @@ def _add_image_visuals(
 
     They start with one appearance.  cellier then gives the three 2D panels
     one image control and the ``vol`` panel another, so the 2D views and the
-    3D view can differ from there on.  The ``vol`` panel's level-of-detail
-    policy differs from the start: it is pinned to the coarsest level and not
-    frustum-culled.  Those appearance fields are not in the control, so it
-    never overwrites them.
+    3D view can differ from there on.  The ``"plane"`` render mode is given
+    to all four and acts in the ``vol`` panel alone, where it draws the 2D
+    views' slices on their planes.  The ``vol`` panel's level-of-detail
+    policy follows its render mode (see ``_VolTransparencyManager``).
     """
-    controller = viewer.controller
     visuals = viewer.add_image_multiscale(
         data_store,
         name="image",
-        **image_visual_kwargs(geometry, render_mode="iso", lod_bias=1.0),
+        **image_visual_kwargs(
+            geometry,
+            render_mode="plane",
+            lod_bias=1.0,
+            channel_render_mode="plane",
+            render_planes_control=True,
+        ),
     )
 
     vol_visual = visuals["vol"]
-    controller.update_appearance_field(
-        vol_visual.id, "force_level", data_store.n_levels - 1
-    )
-    controller.update_appearance_field(vol_visual.id, "frustum_cull", False)
     vol_visual.aabb.enabled = True
     vol_visual.aabb.color = "#ff00ff"
 
@@ -149,13 +155,38 @@ def _center_ortho_slices(viewer: OrthoViewer, geometry: _ViewerGeometry) -> None
     ``OrthoViewer.center_slices`` so the midpoint agrees with
     :attr:`_ViewerGeometry.axis_values`, which spans voxel centres rather than
     voxel edges.  Extra axes (channel) keep position 0.
+
+    Each position is moved to the nearest level-0 voxel centre.  The midpoint
+    of an axis with an even number of voxels is a voxel face, where a slice
+    plane drawn in the 3D view picks the voxel on either side pixel by pixel
+    and looks speckled.
     """
-    center = geometry.center_slice_indices()
+    center = {
+        axis: round(position / float(geometry.level_0_scale[axis]))
+        * float(geometry.level_0_scale[axis])
+        for axis, position in geometry.center_slice_indices().items()
+    }
     for scene in viewer.scenes.values():
         # Panels after the first are usually already mirrored by the axis sync.
         current = scene.dims.selection.slice_indices
         if any(current.get(a) != v for a, v in center.items()):
             viewer.controller.update_slice_indices(scene.id, center)
+
+
+def _link_slice_planes(viewer: OrthoViewer) -> None:
+    """Tie the 3D view's render planes to the 2D views' slices.
+
+    Each plane is outlined in its 2D panel's colour.  The mode sets no render
+    mode: the planes are drawn while the ``vol`` image is in ``"plane"`` mode.
+    """
+    from cellier.visuals import PlaneOutline
+
+    planes = viewer.plane_controller
+    planes.mode = "slices"
+    planes.outlines = tuple(
+        PlaneOutline(enabled=True, color=(*color, 1.0))
+        for color in (_PLANE_COLOR_XY, _PLANE_COLOR_XZ, _PLANE_COLOR_YZ)
+    )
 
 
 # ---------------------------------------------------------------------------

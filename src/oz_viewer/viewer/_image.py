@@ -22,7 +22,8 @@ if TYPE_CHECKING:
     from oz_viewer.viewer._geometry import _ViewerGeometry
 
 # Appearance fields shown in the image control.  Fields that only one mode
-# has (e.g. a channel's ``visible``) appear on that mode's page.
+# has (e.g. a channel's ``visible``) appear on that mode's page.  The
+# level-of-detail bias is its own control (``LevelOfDetailControl``).
 _IMAGE_FIELDS = [
     "visible",
     "opacity",
@@ -31,7 +32,6 @@ _IMAGE_FIELDS = [
     "render_mode",
     "iso_threshold",
     "attenuation",
-    "lod_bias",
 ]
 
 # Composite channel colormaps, in channel order.  Composites blend additively
@@ -73,6 +73,8 @@ def image_visual_kwargs(
     *,
     render_mode: str,
     lod_bias: float,
+    channel_render_mode: str = "mip",
+    render_planes_control: bool = False,
 ) -> dict[str, Any]:
     """Keyword arguments for ``add_image_multiscale`` on either viewer.
 
@@ -84,6 +86,11 @@ def image_visual_kwargs(
         The single-mode 3D render mode, e.g. ``"mip"`` or ``"iso"``.
     lod_bias : float
         Initial level-of-detail bias.
+    channel_render_mode : str
+        The 3D render mode of each composite channel.  Default ``"mip"``.
+    render_planes_control : bool
+        Also show cellier's render planes control, for a visual drawn in the
+        ``"plane"`` render mode.  Default ``False``.
 
     Returns
     -------
@@ -93,7 +100,13 @@ def image_visual_kwargs(
         ``max_channels`` channels (cellier's default); single mode can still
         step through every channel.
     """
-    from cellier.convenience import MultiscaleImageControlsConfig
+    from cellier.convenience import (
+        BoundingBoxControl,
+        ImageControl,
+        LevelOfDetailControl,
+        LoadingIndicator,
+        RenderPlanesControl,
+    )
     from cellier.visuals import (
         MultiscaleImageAppearance,
         MultiscaleImageChannelAppearance,
@@ -103,7 +116,9 @@ def image_visual_kwargs(
     clim_max = geometry.initial_clim_max
     labels = geometry.channel_labels
     kwargs: dict[str, Any] = {
-        "appearance": MultiscaleImageAppearance(lod_bias=lod_bias, attenuation=1.0),
+        "appearance": MultiscaleImageAppearance(
+            settled_lod_bias=lod_bias, attenuation=1.0
+        ),
         "single": MultiscaleImageSingleAppearance(
             color_map="viridis",
             clim=(0.0, clim_max),
@@ -112,13 +127,21 @@ def image_visual_kwargs(
         ),
         "render_config": visual_render_config(),
         "transform": geometry.voxel_to_world,
-        "controls": MultiscaleImageControlsConfig(
-            appearance=_IMAGE_FIELDS,
-            colormap_names=_DEFAULT_COLORMAPS,
-            clim_range=geometry.clim_range,
-            decimals=geometry.slider_decimals,
-            channel_labels=dict(enumerate(labels)) if labels is not None else None,
-        ),
+        "controls": [
+            ImageControl(
+                fields=_IMAGE_FIELDS,
+                colormap_names=_DEFAULT_COLORMAPS,
+                clim_range=geometry.clim_range,
+                decimals=geometry.slider_decimals,
+                channel_labels=(
+                    dict(enumerate(labels)) if labels is not None else None
+                ),
+            ),
+            LevelOfDetailControl(),
+            BoundingBoxControl(),
+            *([RenderPlanesControl()] if render_planes_control else []),
+            LoadingIndicator(),
+        ],
     }
     if geometry.channel_axis is not None:
         n_held = min(geometry.n_channels, _max_channels())
@@ -129,7 +152,7 @@ def image_visual_kwargs(
                 color_map=_CHANNEL_COLORMAPS[i % len(_CHANNEL_COLORMAPS)],
                 clim=(0.0, clim_max),
                 iso_threshold=clim_max / 2.0,
-                render_mode="mip",
+                render_mode=channel_render_mode,
             )
             for i in range(n_held)
         }

@@ -1,10 +1,15 @@
 """Toolkit-independent 3D overlays for the convenience-based orthoviewer.
 
-The orthoviewer's three 3D overlays -- the volume transparency manager, the
-slice-plane meshes, and the orientation gizmo -- all speak only *controller +
-scene id + visual id + mesh store*, never Qt.  This module holds them (ported
-verbatim from the old hand-built orthoviewer) plus :func:`attach_ortho_overlays`,
-which wires them on top of a :class:`cellier.convenience.OrthoViewer`.
+The orthoviewer's 3D overlays -- the orientation gizmo and the manager that
+keeps the volume blending with it -- speak only *controller + scene id +
+visual id + mesh store*, never Qt.  This module holds them plus
+:func:`attach_ortho_overlays`, which wires them on top of a
+:class:`cellier.convenience.OrthoViewer`.
+
+The slice planes of the 3D view are not here: they are cellier's own
+(``OrthoViewer.plane_controller`` in ``"slices"`` mode, see
+:mod:`oz_viewer.viewer._orthoviewer`).  Only their colours are, shared with
+the gizmo and the 2D axis overlays.
 
 Because everything is model/controller-level, these overlays render in both Qt
 and anywidget with no per-toolkit code (conversion plan section 4).
@@ -34,9 +39,8 @@ _AXIS_3D_PRISM_CROSS_SECTION_FRACTION: float = 0.020
 _AXIS_3D_CUBE_COLOUR: tuple[float, float, float, float] = (0.75, 0.75, 0.75, 1.0)
 _N_FACES_PER_BOX: int = 12
 
-# The "Slice overlay opacity" the orthoviewer starts with: the slice plane and
-# the orientation-axis meshes, which the overlay panel's slider drives together.
-_INITIAL_PLANE_OPACITY: float = 0.8
+# The opacity of the orientation-axis meshes.
+_AXES_OPACITY: float = 0.8
 
 
 # ---------------------------------------------------------------------------
@@ -46,43 +50,27 @@ _INITIAL_PLANE_OPACITY: float = 0.8
 
 @dataclass
 class _VolTransparencyProfile:
-    transparency_mode: str
+    #: ``None`` leaves the blending to cellier's default for the render mode.
+    transparency_mode: str | None
     opacity: float
 
 
 _ISO_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 0.3)
 _MIP_DEFAULT_TRANSPARENCY = _VolTransparencyProfile("weighted_blend", 1.0)
+# The slices drawn on their planes are opaque surfaces.
+_PLANE_DEFAULT_TRANSPARENCY = _VolTransparencyProfile(None, 1.0)
 
 
 @dataclass
 class _VisualRenderProfile:
-    """How an overlay mesh blends in one render mode.
-
-    The mesh's opacity is the overlay opacity (the "Slice overlay opacity"
-    slider); a profile only caps it at ``max_opacity``.
-    """
+    """How an overlay mesh blends in one render mode."""
 
     render_order: int
     depth_test: bool
     depth_write: bool
     transparency_mode: str
-    max_opacity: float = 1.0
 
 
-_ISO_PLANE_PROFILE = _VisualRenderProfile(
-    render_order=0,
-    depth_test=True,
-    depth_write=True,
-    transparency_mode="blend",
-)
-_MIP_PLANE_PROFILE = _VisualRenderProfile(
-    render_order=1,
-    depth_test=False,
-    depth_write=True,
-    transparency_mode="weighted_blend",
-    # Kept just below opaque, as this profile always set it.
-    max_opacity=0.99,
-)
 _ISO_AXES_PROFILE = _VisualRenderProfile(
     render_order=1,
     depth_test=True,
@@ -107,14 +95,24 @@ def _is_mip(render_mode: object) -> bool:
     return str(render_mode) in ("mip", "attenuated_mip")
 
 
+def _effective_mode(render_modes: list) -> str:
+    """``"plane"`` or ``"mip"`` if every mode is one, otherwise ``"iso"``."""
+    if all(str(mode) == "plane" for mode in render_modes):
+        return "plane"
+    if all(_is_mip(mode) for mode in render_modes):
+        return "mip"
+    return "iso"
+
+
 class _VolTransparencyManager:
     """Keeps the volume and the overlay meshes blending per render mode.
 
     The effective render mode is the ``vol`` image's: its single appearance's
-    ``render_mode`` in single mode; in composite mode ``"iso"`` if any held
-    channel renders an isosurface, otherwise ``"mip"``.  It is re-read from
-    the model whenever a render mode or the image's single/composite mode
-    changes, whatever the origin (Qt, anywidget, programmatic).
+    ``render_mode`` in single mode; in composite mode ``"plane"`` or ``"mip"``
+    if every held channel renders that way, otherwise ``"iso"``.  It is
+    re-read from the model whenever a render mode or the image's
+    single/composite mode changes, whatever the origin (Qt, anywidget,
+    programmatic).
 
     In single mode the volume's opacity and blending follow a per-render-mode
     profile, and edits made through the 3D view's image control are
@@ -123,8 +121,11 @@ class _VolTransparencyManager:
     follows the mode) and keeps the channels' own opacities; only the meshes
     follow the render mode there.
 
-    The meshes' opacity is :attr:`overlay_opacity`, kept across render-mode
-    switches; each mode's profile only caps it.
+    The level-of-detail policy follows the render mode too.  A volume (iso,
+    mip) is pinned to the coarsest level and not frustum-culled, so the whole
+    of it is always there; the slice planes (``"plane"``) pick their level
+    from the camera as the 2D views do, or they would be drawn at the
+    coarsest level.
 
     Subscribes through ``controller.connect_widget`` (the widget contract:
     ``_id``, ``changed``, ``closed``), so the bus rewires it if the image's
@@ -143,16 +144,13 @@ class _VolTransparencyManager:
         controller,
         vol_visual_id,
         *,
-        plane_visual_id=None,
         axis_visual_ids: list | None = None,
-        overlay_opacity: float = _INITIAL_PLANE_OPACITY,
     ) -> None:
         self._id = uuid4()
-        self._overlay_opacity = float(overlay_opacity)
         self._controller = controller
         self._vol_visual_id = vol_visual_id
-        self._plane_visual_id = plane_visual_id
         self._axis_visual_ids: list = axis_visual_ids or []
+        self._coarsest_level = len(self._vol_visual().level_transforms) - 1
         self._vol_profiles: dict[str, _VolTransparencyProfile] = {
             "iso": _VolTransparencyProfile(
                 transparency_mode=_ISO_DEFAULT_TRANSPARENCY.transparency_mode,
@@ -162,14 +160,16 @@ class _VolTransparencyManager:
                 transparency_mode=_MIP_DEFAULT_TRANSPARENCY.transparency_mode,
                 opacity=_MIP_DEFAULT_TRANSPARENCY.opacity,
             ),
+            "plane": _VolTransparencyProfile(
+                transparency_mode=_PLANE_DEFAULT_TRANSPARENCY.transparency_mode,
+                opacity=_PLANE_DEFAULT_TRANSPARENCY.opacity,
+            ),
         }
-        self._plane_profiles: dict[str, _VisualRenderProfile] = {
-            "iso": _ISO_PLANE_PROFILE,
-            "mip": _MIP_PLANE_PROFILE,
-        }
+        # The planes are opaque surfaces, as an isosurface is.
         self._axes_profiles: dict[str, _VisualRenderProfile] = {
             "iso": _ISO_AXES_PROFILE,
             "mip": _MIP_AXES_PROFILE,
+            "plane": _ISO_AXES_PROFILE,
         }
         self._current_mode = self._read_mode()
         controller.connect_widget(self, subscription_specs=self._subscription_specs())
@@ -177,20 +177,6 @@ class _VolTransparencyManager:
     @property
     def current_mode(self) -> str:
         return self._current_mode
-
-    @property
-    def overlay_opacity(self) -> float:
-        """The slice plane's and orientation meshes' opacity.
-
-        Setting it re-applies the meshes' profiles, so it holds across
-        render-mode switches.
-        """
-        return self._overlay_opacity
-
-    @overlay_opacity.setter
-    def overlay_opacity(self, value: float) -> None:
-        self._overlay_opacity = float(value)
-        self._apply_mesh_profiles()
 
     @property
     def current_profile(self) -> _VolTransparencyProfile:
@@ -202,9 +188,8 @@ class _VolTransparencyManager:
     def _read_mode(self) -> str:
         visual = self._vol_visual()
         if visual.composite:
-            modes = [ch.render_mode for ch in visual.channels.values()]
-            return "mip" if all(_is_mip(m) for m in modes) else "iso"
-        return "mip" if _is_mip(visual.single.render_mode) else "iso"
+            return _effective_mode([ch.render_mode for ch in visual.channels.values()])
+        return _effective_mode([visual.single.render_mode])
 
     def _subscription_specs(self) -> list:
         from cellier.events import (
@@ -264,17 +249,12 @@ class _VolTransparencyManager:
             self.apply()
 
     def _apply_profile_to_mesh(self, visual_id, profile: _VisualRenderProfile) -> None:
-        if visual_id is None:
-            return
         c = self._controller
         c.update_appearance_field(visual_id, "render_order", profile.render_order)
         c.update_appearance_field(visual_id, "depth_test", profile.depth_test)
         c.update_appearance_field(visual_id, "depth_write", profile.depth_write)
         c.update_appearance_field(
             visual_id, "transparency_mode", profile.transparency_mode
-        )
-        c.update_appearance_field(
-            visual_id, "opacity", min(self._overlay_opacity, profile.max_opacity)
         )
 
     def _apply_vol_profile(self) -> None:
@@ -294,7 +274,9 @@ class _VolTransparencyManager:
             c.update_appearance_field(vid, "depth_write", True, source_id=self._id)
             return
         vol = self.current_profile
-        depth_write = vol.transparency_mode == "weighted_solid"
+        # With no mode of its own the volume takes cellier's defaults, as a
+        # composite does.
+        depth_write = vol.transparency_mode in (None, "weighted_solid")
         c.update_appearance_field(
             vid, "transparency_mode", vol.transparency_mode, source_id=self._id
         )
@@ -303,13 +285,25 @@ class _VolTransparencyManager:
             vid, "opacity", vol.opacity, source_id=self._id
         )
 
+    def _apply_level_of_detail(self) -> None:
+        """Pin a volume to the coarsest level; let the slice planes choose."""
+        c = self._controller
+        vid = self._vol_visual_id
+        planes = self._current_mode == "plane"
+        c.update_appearance_field(
+            vid,
+            "force_level",
+            None if planes else self._coarsest_level,
+            source_id=self._id,
+        )
+        c.update_appearance_field(vid, "frustum_cull", planes, source_id=self._id)
+
     def apply(self) -> None:
+        self._apply_level_of_detail()
         self._apply_vol_profile()
         self._apply_mesh_profiles()
 
     def _apply_mesh_profiles(self) -> None:
-        plane_profile = self._plane_profiles[self._current_mode]
-        self._apply_profile_to_mesh(self._plane_visual_id, plane_profile)
         axes_profile = self._axes_profiles[self._current_mode]
         for vid in self._axis_visual_ids:
             self._apply_profile_to_mesh(vid, axes_profile)
@@ -558,7 +552,7 @@ def _make_axis_meshes(
         appearance = MeshFlatAppearance(
             color_mode="face",
             side="both",
-            opacity=_INITIAL_PLANE_OPACITY,
+            opacity=_AXES_OPACITY,
             render_order=1,
             depth_test=True,
             depth_write=True,
@@ -576,143 +570,6 @@ def _make_axis_meshes(
         axis_visuals.append(visual)
 
     return tuple(axis_visuals), tuple(axis_stores)
-
-
-def _make_plane_positions(
-    z_world: float,
-    y_world: float,
-    x_world: float,
-    world_max_zyx: np.ndarray,
-) -> np.ndarray:
-    """``(12, 3)`` ``(z, y, x)`` vertices of the three slice planes."""
-    wz = float(world_max_zyx[0])
-    wy = float(world_max_zyx[1])
-    wx = float(world_max_zyx[2])
-    z, y, x = float(z_world), float(y_world), float(x_world)
-
-    positions = np.zeros((12, 3), dtype=np.float32)
-
-    # XY plane (constant Z = z)
-    positions[0:4, 0] = z
-    positions[0:4, 1] = [0.0, wy, wy, 0.0]
-    positions[0:4, 2] = [0.0, 0.0, wx, wx]
-
-    # XZ plane (constant Y = y)
-    positions[4:8, 0] = [0.0, wz, wz, 0.0]
-    positions[4:8, 1] = y
-    positions[4:8, 2] = [0.0, 0.0, wx, wx]
-
-    # YZ plane (constant X = x)
-    positions[8:12, 0] = [0.0, wz, wz, 0.0]
-    positions[8:12, 1] = [0.0, 0.0, wy, wy]
-    positions[8:12, 2] = x
-
-    return positions
-
-
-def _make_plane_colors(opacity: float) -> np.ndarray:
-    a = float(opacity)
-    return np.array(
-        [
-            [*_PLANE_COLOR_XY, a],
-            [*_PLANE_COLOR_XY, a],
-            [*_PLANE_COLOR_XZ, a],
-            [*_PLANE_COLOR_XZ, a],
-            [*_PLANE_COLOR_YZ, a],
-            [*_PLANE_COLOR_YZ, a],
-        ],
-        dtype=np.float32,
-    )
-
-
-def _make_plane_mesh(
-    controller,
-    vol_scene,
-    z_world: float,
-    y_world: float,
-    x_world: float,
-    world_max_zyx: np.ndarray,
-    initial_opacity: float = 0.4,
-    *,
-    spatial_axes: tuple[int, int, int],
-):
-    from cellier.visuals import MeshFlatAppearance
-
-    world = vol_scene.dims.world_coordinate_system
-    positions = _make_plane_positions(z_world, y_world, x_world, world_max_zyx)
-    colors = _make_plane_colors(initial_opacity)
-    indices = np.array(
-        [[0, 1, 2], [0, 2, 3], [4, 5, 6], [4, 6, 7], [8, 9, 10], [8, 10, 11]],
-        dtype=np.int32,
-    )
-
-    store = _spatial_mesh_store(
-        positions,
-        indices,
-        colors,
-        "slice_planes",
-        world=world,
-        spatial_axes=spatial_axes,
-    )
-    appearance = MeshFlatAppearance(
-        color_mode="face", side="both", opacity=initial_opacity, wireframe=False
-    )
-    visual = controller.add_mesh(
-        data=store,
-        scene_id=vol_scene.id,
-        appearance=appearance,
-        name="slice_planes",
-        transform=_mesh_to_world(store, world, spatial_axes),
-    )
-    return store, visual
-
-
-class _PlaneUpdater:
-    def __init__(
-        self,
-        controller,
-        plane_store,
-        plane_visual,
-        world_max_zyx,
-        *,
-        spatial_axes: tuple[int, int, int],
-    ) -> None:
-        self._id = uuid4()
-        self._controller = controller
-        self._plane_store = plane_store
-        self._plane_visual = plane_visual
-        self._world_max_zyx = world_max_zyx
-        self._spatial_axes = spatial_axes
-
-        # Read initial slice positions from the (z, y, x) positions array.
-        positions = plane_store.positions
-        self._z_world = float(positions[0, 0])  # XY plane vertex 0: Z
-        self._y_world = float(positions[4, 1])  # XZ plane vertex 4: Y
-        self._x_world = float(positions[8, 2])  # YZ plane vertex 8: X
-
-    def _update(self) -> None:
-        self._plane_store.positions = _make_plane_positions(
-            self._z_world, self._y_world, self._x_world, self._world_max_zyx
-        )
-        self._controller.reslice_visual(self._plane_visual.id)
-
-    def on_xy_dims_changed(self, event) -> None:
-        sz0 = self._spatial_axes[0]
-        if sz0 in event.slice_indices:
-            self._z_world = float(event.slice_indices[sz0])
-            self._update()
-
-    def on_xz_dims_changed(self, event) -> None:
-        sz1 = self._spatial_axes[1]
-        if sz1 in event.slice_indices:
-            self._y_world = float(event.slice_indices[sz1])
-            self._update()
-
-    def on_yz_dims_changed(self, event) -> None:
-        sz2 = self._spatial_axes[2]
-        if sz2 in event.slice_indices:
-            self._x_world = float(event.slice_indices[sz2])
-            self._update()
 
 
 class _OrientationUpdater:
@@ -816,10 +673,7 @@ class OrthoOverlays:
     """
 
     transparency_manager: _VolTransparencyManager
-    plane_visual: object
-    plane_store: object
     axis_visual_ids: list
-    _plane_updater: _PlaneUpdater
     _orientation_updater: _OrientationUpdater
     _owner_ids: list
     _controller: object
@@ -837,10 +691,10 @@ def attach_ortho_overlays(
     *,
     vol_visual_id,
 ) -> OrthoOverlays:
-    """Attach the slice-plane, orientation, and transparency overlays.
+    """Attach the orientation and transparency overlays.
 
-    Builds the plane + orientation-gizmo meshes in the ``vol`` scene only,
-    wires the updaters to the 2D panels' dims/camera events, and installs the
+    Builds the orientation-gizmo meshes in the ``vol`` scene only, wires
+    their updater to the 2D panels' dims/camera events, and installs the
     volume transparency manager.  Everything is model/controller-level, so the
     overlays render identically under Qt and anywidget.
 
@@ -884,42 +738,12 @@ def attach_ortho_overlays(
     )
     axis_visual_ids = [xy_axis_visual.id, xz_axis_visual.id, yz_axis_visual.id]
 
-    # --- slice-plane mesh (vol scene only) ---
-    plane_store, plane_visual = _make_plane_mesh(
-        controller,
-        vol_scene,
-        z_mid,
-        y_mid,
-        x_mid,
-        world_max_zyx,
-        initial_opacity=_INITIAL_PLANE_OPACITY,
-        spatial_axes=spatial_axes,
-    )
-
-    plane_updater = _PlaneUpdater(
-        controller=controller,
-        plane_store=plane_store,
-        plane_visual=plane_visual,
-        world_max_zyx=world_max_zyx,
-        spatial_axes=spatial_axes,
-    )
-    controller.on_dims_changed(
-        scenes["xy"].id, plane_updater.on_xy_dims_changed, owner_id=plane_updater._id
-    )
-    controller.on_dims_changed(
-        scenes["xz"].id, plane_updater.on_xz_dims_changed, owner_id=plane_updater._id
-    )
-    controller.on_dims_changed(
-        scenes["yz"].id, plane_updater.on_yz_dims_changed, owner_id=plane_updater._id
-    )
-
     # --- volume transparency manager ---
     # Follows the vol image's render mode and single/composite mode from any
     # origin (Qt, anywidget, programmatic) through the controller bus.
     transparency_manager = _VolTransparencyManager(
         controller,
         vol_visual_id,
-        plane_visual_id=plane_visual.id,
         axis_visual_ids=axis_visual_ids,
     )
     transparency_manager.apply()
@@ -958,7 +782,7 @@ def attach_ortho_overlays(
     # No channel following is needed: the overlay meshes are broadcast over
     # every non-spatial world axis (see _mesh_to_world), so moving a channel or
     # time slider leaves them in place.
-    owner_ids = [plane_updater._id, orient_updater._id]
+    owner_ids = [orient_updater._id]
 
     # --- seed the orientation gizmo from post-fit camera state ---
     # The initial camera fit is deferred to the canvas first frame (fit="ready"),
@@ -988,10 +812,7 @@ def attach_ortho_overlays(
 
     return OrthoOverlays(
         transparency_manager=transparency_manager,
-        plane_visual=plane_visual,
-        plane_store=plane_store,
         axis_visual_ids=axis_visual_ids,
-        _plane_updater=plane_updater,
         _orientation_updater=orient_updater,
         _owner_ids=owner_ids,
         _controller=controller,

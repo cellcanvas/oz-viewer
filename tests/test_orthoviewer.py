@@ -69,24 +69,35 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         assert set(build.viewer.scenes) == {"xy", "xz", "yz", "vol"}
         assert not any(v.composite for v in build.visuals.values())
 
-        # One starting appearance; only the vol panel's LOD policy differs.
-        assert build.visuals["vol"].appearance.force_level is not None
-        assert build.visuals["vol"].appearance.frustum_cull is False
+        # The 3D view draws the 2D views' slices on their planes, so it picks
+        # its level of detail from the camera as they do.
+        vol = build.visuals["vol"]
+        assert vol.single.render_mode == "plane"
+        assert vol.appearance.force_level is None
+        assert vol.appearance.frustum_cull is True
         assert build.visuals["xy"].appearance.force_level is None
 
-        # Overlays attached: plane + three orientation-axis meshes, ISO profile.
+        # Overlays attached: three orientation-axis meshes, plane profile.
         overlays = build.overlays
         assert overlays is not None
         assert len(overlays.axis_visual_ids) == 3
-        assert overlays.transparency_manager.current_mode == "iso"
+        assert overlays.transparency_manager.current_mode == "plane"
 
-        # A dims change reaches the overlays: the slice plane and the gizmo
-        # follow the XY panel's slider.  Off the voxel grid on purpose -- slice
+        # cellier ties three outlined render planes to the 2D sliders; they
+        # start on a voxel centre (z is 200 voxels of 5 um: 497.5 is a face).
+        planes = build.viewer.plane_controller
+        assert planes.mode == "slices"
+        assert len(vol.render_planes) == 3
+        assert all(plane.outline.enabled for plane in vol.render_planes)
+        assert planes.positions()[0] == pytest.approx(500.0)
+
+        # A dims change reaches both: the slice plane and the gizmo follow
+        # the XY panel's slider.  Off the voxel grid on purpose -- slice
         # positions are floats, and an integer is where rounding rules agree.
         controller = build.viewer.controller
         z_axis = handle.geometry.spatial_axes[0]
         controller.update_slice_indices(build.viewer.scenes["xy"].id, {z_axis: 12.3})
-        assert overlays.plane_store.positions[0, 0] == pytest.approx(12.3)
+        assert vol.render_planes[0].origin[0] == pytest.approx(12.3)
         gizmo = controller.get_visual_model(overlays.axis_visual_ids[0])
         assert gizmo.transform.translation[z_axis] == pytest.approx(12.3)
 
@@ -95,7 +106,7 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         assert "Left" in titles
         assert "Overlays" in titles
         names = _dock_control_names(handle.window, "Left")
-        assert {"Contrast", "Colormap", "Render mode", "LOD bias"} <= names
+        assert {"Contrast", "Colormap", "Render mode", "Settled bias"} <= names
         assert "Data fetch status" in names
 
         # One control for the three 2D views and one for the 3D view, chosen
@@ -108,6 +119,21 @@ def test_single_channel_ortho_build(qapp, tmp_path):
         views_2d, view_3d = appearance_targets(build.viewer)
         assert views_2d.visual_ids == [build.visuals[k].id for k in ("xy", "xz", "yz")]
         assert view_3d.visual_ids == [build.vol_visual_id]
+
+        # Only the 3D view's control lists the render planes.
+        from PySide6.QtWidgets import QComboBox, QDockWidget
+
+        assert "Render planes" not in names
+        dock = next(
+            d
+            for d in handle.window.findChildren(QDockWidget)
+            if d.windowTitle() == "Left"
+        )
+        (selector,) = [
+            c for c in dock.findChildren(QComboBox) if c.findText(view_3d.label) >= 0
+        ]
+        selector.setCurrentIndex(selector.findText(view_3d.label))
+        assert "Render planes" in _dock_control_names(handle.window, "Left")
     finally:
         handle.close()
 
@@ -129,15 +155,15 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
         for scene in viewer.scenes.values():
             assert 0 not in scene.slider_axes
 
-        # Composite channels render MIP, so the overlays use the MIP profile.
+        # Composite channels are drawn on the slice planes, so the overlays
+        # use the plane profile.
         manager = build.overlays.transparency_manager
-        assert manager.current_mode == "mip"
+        assert manager.current_mode == "plane"
 
         # The overlay meshes are 3-D (z, y, x) and broadcast over the channel
         # axis, so they exist at every channel without per-channel updates.
         world = viewer.scenes["vol"].dims.world_coordinate_system
-        overlay_ids = (build.overlays.plane_visual.id, *build.overlays.axis_visual_ids)
-        for visual_id in overlay_ids:
+        for visual_id in build.overlays.axis_visual_ids:
             transform = controller.get_visual_model(visual_id).transform
             assert transform.broadcast_axes == frozenset({world.axes[0].id})
 
@@ -161,17 +187,24 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
         assert "Composite channels" in names
 
         # Runtime switch to single mode: every panel follows, the channel axis
-        # gets a slider, and the manager picks up the single ISO render mode
-        # and applies its volume profile.
+        # gets a slider, and the manager follows the single render mode.
         vol_id = build.vol_visual_id
         viewer.set_image_composite(build.visuals, False)
         assert not any(v.composite for v in build.visuals.values())
         for scene in viewer.scenes.values():
             assert 0 in scene.slider_axes
-        assert manager.current_mode == "iso"
+        assert manager.current_mode == "plane"
         vol = controller.get_visual_model(vol_id)
+        assert vol.appearance.force_level is None
+
+        # A volume render mode applies its profile and pins the volume to the
+        # coarsest level.
+        controller.update_single_appearance_field(vol_id, "render_mode", "iso")
+        assert manager.current_mode == "iso"
         assert vol.single.opacity == pytest.approx(manager.current_profile.opacity)
         assert vol.appearance.transparency_mode == "weighted_blend"
+        assert vol.appearance.force_level == len(vol.level_transforms) - 1
+        assert vol.appearance.frustum_cull is False
 
         # An opacity edit through the image group is remembered per mode.
         viewer.update_image_single_field(build.visuals, "opacity", 0.6)
@@ -180,8 +213,9 @@ def test_multichannel_ortho_build(qapp, write_demo_ome):
         # Back to composite: blending returns to cellier's default, and the
         # remembered ISO profile is re-applied on the next switch to single.
         viewer.set_image_composite(build.visuals, True)
-        assert manager.current_mode == "mip"
+        assert manager.current_mode == "plane"
         assert vol.appearance.transparency_mode is None
+        assert vol.appearance.force_level is None
         viewer.set_image_composite(build.visuals, False)
         assert vol.single.opacity == pytest.approx(0.6)
     finally:
@@ -223,14 +257,9 @@ def test_the_2d_and_3d_views_are_edited_separately(qapp, tmp_path):
         handle.close()
 
 
-def test_the_slice_overlays_start_at_0_8_and_keep_the_slider_value(qapp, tmp_path):
-    """The overlay opacity holds across render-mode switches.
-
-    The transparency manager used to write a fixed opacity per render mode
-    onto the slice plane and orientation meshes, overriding the slider.
-    """
-    from PySide6.QtWidgets import QDockWidget
-    from superqt import QLabeledDoubleSlider
+def test_the_orientation_axes_keep_their_opacity_across_render_modes(qapp, tmp_path):
+    """Only the blending of the orientation meshes follows the render mode."""
+    from PySide6.QtWidgets import QCheckBox, QDockWidget
 
     from oz_viewer.data._blobs import make_example_zarr
     from oz_viewer.viewer._orthoviewer import _build_and_show_ortho_qt
@@ -241,29 +270,32 @@ def test_the_slice_overlays_start_at_0_8_and_keep_the_slider_value(qapp, tmp_pat
         build = handle.build
         controller = build.viewer.controller
         overlays = build.overlays
-        mesh_ids = [overlays.plane_visual.id, *overlays.axis_visual_ids]
+        mesh_ids = overlays.axis_visual_ids
 
-        def opacities():
-            return [controller.get_visual_model(v).appearance.opacity for v in mesh_ids]
+        def appearances():
+            return [controller.get_visual_model(v).appearance for v in mesh_ids]
 
-        assert opacities() == pytest.approx([0.8] * 4)
-        assert overlays.plane_store.colors[:, 3] == pytest.approx([0.8] * 6)
+        assert [a.opacity for a in appearances()] == pytest.approx([0.8] * 3)
+        assert all(a.depth_test for a in appearances())
+
+        vol = build.vol_visual_id
+        controller.update_single_appearance_field(vol, "render_mode", "mip")
+        assert overlays.transparency_manager.current_mode == "mip"
+        assert [a.opacity for a in appearances()] == pytest.approx([0.8] * 3)
+        assert not any(a.depth_test for a in appearances())
+
+        controller.update_single_appearance_field(vol, "render_mode", "plane")
+        assert overlays.transparency_manager.current_mode == "plane"
+        assert all(a.depth_test for a in appearances())
+
+        # The Qt-only panel toggles them.
         dock = next(
             d
             for d in handle.window.findChildren(QDockWidget)
             if d.windowTitle() == "Overlays"
         )
-        (slider,) = dock.findChildren(QLabeledDoubleSlider)
-        assert slider.value() == pytest.approx(0.8)
-
-        # Switching render mode keeps it (MIP caps the plane at 0.99).
-        vol = build.vol_visual_id
-        controller.update_single_appearance_field(vol, "render_mode", "mip")
-        assert overlays.transparency_manager.current_mode == "mip"
-        assert opacities() == pytest.approx([0.8] * 4)
-
-        slider.setValue(0.5)
-        controller.update_single_appearance_field(vol, "render_mode", "iso")
-        assert opacities() == pytest.approx([0.5] * 4)
+        (toggle,) = dock.findChildren(QCheckBox)
+        toggle.setChecked(False)
+        assert not any(a.visible for a in appearances())
     finally:
         handle.close()

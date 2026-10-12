@@ -68,9 +68,12 @@ def build_viewer(
     """
     from cellier.convenience import Viewer
 
+    # Start in 2D on the last two spatial axes (y, x).
     viewer = Viewer(
         geometry.world,
-        dim="2d",
+        displayed_axes=tuple(
+            geometry.world.axes[i].id for i in geometry.spatial_indices[-2:]
+        ),
         render_config=controller_render_config(),
         gui=gui,
     )
