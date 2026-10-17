@@ -163,3 +163,45 @@ def test_controls_are_control_models(qapp, tmp_path, write_demo_ome, fixture_nam
         "BoundingBoxControl",
         "LoadingIndicator",
     ]
+
+
+@pytest.mark.parametrize(
+    ("level_0_shape", "expected"),
+    [
+        ((64, 64, 64), 32),
+        # 255 cells of 32 voxels: the longest axis that still fits.
+        ((8160, 100, 100), 32),
+        ((100, 8161, 100), 64),
+        # The HiP-CT overview that failed in 3D at block 32 (267 cells).
+        ((7569, 7569, 8514), 64),
+        ((16320, 16320, 16320), 64),
+        ((16321, 100, 100), 128),
+    ],
+)
+def test_block_size_keeps_brick_grid_within_cellier_limit(level_0_shape, expected):
+    """The block size grows until no axis needs more than 255 bricks."""
+    import math
+
+    from cellier.render.lut_indirection._layout_3d import BlockLayout3D
+
+    from oz_viewer.viewer._image import choose_block_size, visual_render_config
+
+    block_size = choose_block_size(level_0_shape)
+    assert block_size == expected
+    assert math.ceil(max(level_0_shape) / block_size) <= 255
+    assert visual_render_config(level_0_shape).block_size == expected
+    # Cellier's own check, which raised for the HiP-CT store at block 32.
+    BlockLayout3D(volume_shape=tuple(level_0_shape), block_size=block_size)
+
+
+def test_image_block_size_ignores_channel_axis(qapp, write_demo_ome):
+    """The block size comes from the store's spatial axes, not its channels."""
+    from oz_viewer.viewer._geometry import extract_viewer_geometry
+    from oz_viewer.viewer._image import image_visual_kwargs
+
+    _store, geometry = extract_viewer_geometry(
+        f"file://{write_demo_ome('image')}", print_summary=False
+    )
+    assert geometry.level_0_shape_spatial == (1, 64, 64)
+    kwargs = image_visual_kwargs(geometry, render_mode="mip", lod_bias=1.0)
+    assert kwargs["render_config"].block_size == 32

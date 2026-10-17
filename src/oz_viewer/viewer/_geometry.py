@@ -43,6 +43,8 @@ class _ViewerGeometry(NamedTuple):
     voxel_to_world: AffineTransform
     #: World units per level-0 voxel, for every axis.
     level_0_scale: np.ndarray
+    #: Level-0 voxel counts of the spatial axes, in order.
+    level_0_shape_spatial: tuple[int, ...]
     #: World-space ``(shape - 1) * scale`` for every axis, used for centering.
     world_max_full: np.ndarray
     #: World-space ``(shape - 1) * scale`` for the spatial axes only.
@@ -259,6 +261,9 @@ def extract_viewer_geometry(
         world=world,
         voxel_to_world=voxel_to_world,
         level_0_scale=level_0_scale_full,
+        level_0_shape_spatial=tuple(
+            int(data_store.level_shapes[0][i]) for i in spatial_indices
+        ),
         world_max_full=world_max_full,
         world_max_spatial=world_max_spatial,
         initial_clim_max=initial_clim_max,

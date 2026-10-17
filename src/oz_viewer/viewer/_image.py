@@ -11,11 +11,14 @@ Also holds the render-pipeline configs the two viewers share.
 
 from __future__ import annotations
 
+import math
 from typing import TYPE_CHECKING, Any
 
 from oz_viewer.viewer._widgets import _DEFAULT_COLORMAPS
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from cellier.render import RenderManagerConfig
     from cellier.visuals import MultiscaleImageRenderConfig
 
@@ -38,6 +41,13 @@ _IMAGE_FIELDS = [
 # by default, so each colormap starts from black.
 _CHANNEL_COLORMAPS = ["green", "magenta", "cyan", "red"]
 
+# The brick side used when the store's brick grid fits cellier's limit.
+_DEFAULT_BLOCK_SIZE = 32
+
+# Cellier's 3D brick grid holds at most this many cells along an axis (its
+# lookup texture is uint8); a larger grid raises when a 3D view is built.
+_MAX_GRID_CELLS = 255
+
 
 def controller_render_config() -> RenderManagerConfig:
     """The controller render-pipeline config used by both viewers."""
@@ -46,16 +56,46 @@ def controller_render_config() -> RenderManagerConfig:
     return RenderManagerConfig(temporal=TemporalAccumulationConfig(enabled=False))
 
 
-def visual_render_config() -> MultiscaleImageRenderConfig:
+def choose_block_size(level_0_shape: Sequence[int]) -> int:
+    """The brick side for a store whose displayed axes have *level_0_shape*.
+
+    The default when its brick grid fits cellier's limit of
+    ``_MAX_GRID_CELLS`` cells an axis, otherwise the default doubled until
+    the grid of the longest axis fits.
+
+    Parameters
+    ----------
+    level_0_shape : Sequence[int]
+        Level-0 voxel counts of the axes a view may display (the spatial
+        axes, not the channel axis).
+
+    Returns
+    -------
+    int
+    """
+    longest = max(level_0_shape, default=0)
+    block_size = _DEFAULT_BLOCK_SIZE
+    while math.ceil(longest / block_size) > _MAX_GRID_CELLS:
+        block_size *= 2
+    return block_size
+
+
+def visual_render_config(level_0_shape: Sequence[int]) -> MultiscaleImageRenderConfig:
     """LOD / GPU-budget config for the multiscale image visual.
 
     The 3D budget is only allocated by panels that render in 3D, so the
     orthoviewer's 2D panels can share this config.
+
+    Parameters
+    ----------
+    level_0_shape : Sequence[int]
+        Level-0 voxel counts of the spatial axes; sets the block size (see
+        :func:`choose_block_size`).
     """
     from cellier.visuals import MultiscaleImageRenderConfig
 
     return MultiscaleImageRenderConfig(
-        block_size=32,
+        block_size=choose_block_size(level_0_shape),
         gpu_budget_bytes=2048 * 1024**2,
         gpu_budget_bytes_2d=64 * 1024**2,
     )
@@ -125,7 +165,7 @@ def image_visual_kwargs(
             iso_threshold=clim_max / 2.0,
             render_mode=render_mode,
         ),
-        "render_config": visual_render_config(),
+        "render_config": visual_render_config(geometry.level_0_shape_spatial),
         "transform": geometry.voxel_to_world,
         "controls": [
             ImageControl(
